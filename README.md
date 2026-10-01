@@ -1,132 +1,125 @@
-> **This is Tandem**, a fork of llama.cpp (release b11200) that serves hybrid linear-attention GUI-agent models on
-> Snapdragon NPUs. On a Snapdragon 8 Elite phone it serves the agent steps of a Qwen3.5-4B policy 1.2-1.3× faster
-> and with 26% less energy than llama.cpp's NPU backend, 3.3-14× faster than GPU and CPU engines, and cuts the
-> standby power of a phone with the model loaded 3.4×. See **[TANDEM.md](TANDEM.md)** for the results, what Tandem
-> changes, and how to build and run it. The rest of this README is upstream llama.cpp's.
+# Tandem: serving hybrid linear-attention GUI agents on mobile NPUs
 
-# llama.cpp
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Based on llama.cpp b11200](https://img.shields.io/badge/based%20on-llama.cpp%20b11200-informational)](https://github.com/ggml-org/llama.cpp)
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+Tandem serves hybrid linear-attention models, such as Qwen3.5 with its Gated DeltaNet layers, as the policy of a GUI
+agent on the Hexagon NPU of Snapdragon phones. It is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) and a
+**drop-in replacement for `llama-server`**: the HTTP API is unchanged, so an agent switches to Tandem by starting a
+different binary.
 
-<div align="center">
+On a Snapdragon 8 Elite phone serving the fine-tuned Qwen3.5-4B policy of a deployed GUI agent, compared with
+llama.cpp's NPU backend in its fastest configuration, Tandem
 
-<b>LLM inference in C/C++</b>
+- serves text steps **1.32× faster** (24% less time per step) and screenshot steps **1.19× faster** (16% less time),
+- uses **26% less energy** per step,
+- cuts the standby power of a phone with the model loaded **3.4×**, to the level of a phone without a model server,
+- and is **3.3–14× faster** than llama.cpp and MNN on the phone's GPU and CPU.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+## Why agents need their own serving runtime
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+Engines built for chat leave three costs in every agent step of a hybrid model. Tandem treats the agent step as its unit
+of work and removes them:
 
-</div>
+| | What goes wrong | llama.cpp on the NPU | Tandem |
+|---|---|---|---|
+| **Checkpoint gap** | The recurrent state resumes only at stored checkpoints, and a chat server stores them where a chat would continue | 539 new prompt tokens per step, where a KV cache would need 428 | **443**, with checkpoints where consecutive prompts diverge |
+| **Rollback tax** | Speculative decoding has to roll the recurrent state back, which pushes the prefill off the NPU's fast kernel | speculation makes a step **0.58 s slower** | speculation makes a step **0.30 s faster** |
+| **Residency tax** | The NPU session holds its power votes for as long as the model is loaded | 0.76 W standby with the model loaded | **0.22 W**, as little as without a model server |
+
+## Results
+
+![Server time per agent step: Tandem 1.49 s per text step and 4.87 s per screenshot step; llama.cpp on the NPU 1.97 and 5.80 s; with speculation 2.56 and 7.60 s; MNN on the GPU 4.98 and 19.1 s; llama.cpp on the GPU 5.08 and 22.8 s; llama.cpp on the CPU 11.2 and 69.8 s](docs/tandem/step-time.svg)
+
+Server time per agent step on a OnePlus 13T (Snapdragon 8 Elite, Hexagon v79) for a fine-tuned Qwen3.5-4B with 4-bit
+weights (Q4_K_M), replaying the agent's real traffic: 61 text steps and 21 steps with a screenshot. Every engine runs in
+its fastest configuration unless marked. MNN's screenshot step is the mean of 4 of the 21 steps; llama.cpp's CPU
+screenshot step is from a separate run with speculation.
+
+- **Energy.** On battery, a text step costs 11.1 J above idle power under Tandem against 15.0 J under llama.cpp's NPU
+  backend.
+- **Standby power.** With the model loaded and the screen off, the phone draws 0.22 W under Tandem instead of 0.76 W.
+  The next request pays a few milliseconds to restore the power votes.
+- **Hybrid on par with full attention.** llama.cpp serves the hybrid Qwen3.5-4B 1.38× slower than a full-attention
+  model of the same size (Qwen3-VL-4B); under Tandem the two are equally fast.
+- **Same answers.** The kernels, the draft head and idle power release leave every output bit unchanged; the
+  checkpoint policy and speculation change only the floating-point rounding, which reworded at most one free-text
+  summary per trace and changed no action.
+
+![Text-step speedup over llama.cpp on the NPU: Qwen3.5-2B 1.27x, Qwen3.5-4B 1.34x, Qwen3.5-9B 1.42x, the agent policy on the Snapdragon 8 Elite 1.32x and on the Snapdragon 8 Elite Gen 5 1.32x, AndroidControl 1.30x](docs/tandem/speedup.svg)
+
+The gains hold for the stock Qwen3.5 models (top), on the next NPU generation (OnePlus 15, Snapdragon 8 Elite Gen 5,
+Hexagon v81: 1.28 s against 1.69 s per text step, 3.95 s against 4.67 s per screenshot step), and on the public
+AndroidControl benchmark (its first 300 test steps, with identical answers).
+
+In these comparisons, Tandem runs with checkpoints at the divergence point but keeps llama.cpp's tail pass. Dropping it
+as well, as `--agent-checkpoints` does, shortens a text step by about another 0.09 s.
+
+## What Tandem changes
+
+| Mechanism | Where | What it does | Switch (default) |
+|---|---|---|---|
+| Divergence-point checkpoints | server | checkpoints the recurrent state where the prompt stops matching the previous one, so the next step resumes there | `--agent-checkpoints` (or `LLAMA_CKPT_DIVERGE=1`) |
+| No chat-only passes | server | drops the extra pass over the last 4 prompt tokens and the re-snapshot of a restored state, which only a chat's next turn uses | `--agent-checkpoints` (or `LLAMA_CKPT_TAIL=0`) |
+| Checkpoint before an image | server | a checkpoint right before the screenshot, for re-queries of the same screen | `LLAMA_CKPT_BEFORE_IMAGE=2` (off) |
+| Rollback-aware recurrent prefill | NPU | keeps the rollback snapshots of speculative decoding on the chunked matrix-unit kernel | on |
+| Column-shared verification kernel | NPU | verifies up to 4 tokens at little more than the cost of one: each weight block is unpacked once for all columns | on |
+| Trimmed draft head | model file | the MTP head drafts over 32,768 rows of the output matrix instead of the full vocabulary | `tools/tandem/make_draft_head.py` |
+| Channel-major convolution, DMA state gathers, fused SwiGLU | NPU | less data movement per prefill pass | on |
+| DDR performance vote | NPU | raises the memory controller's performance mode while requests run | `GGML_HEXAGON_PWR=1` |
+| Idle power release | NPU | relaxes the session's power votes after an idle period and restores them before the next batch | `GGML_HEXAGON_IDLE_MS=3000` |
+| Work-queue race fix, watchdog | NPU | the server runs for thousands of requests; an NPU that stops answering becomes a restartable crash | on, `GGML_HEXAGON_WATCHDOG=60` |
+
+The NPU paths can be switched off for comparison with `GGML_HEXAGON_TANDEM_OFF`, a bitmask: 1 verification kernel,
+2 rollback-aware prefill, 4 and 8 conv-state gathers, 16 fused SwiGLU. With all of Tandem's switches off, the build runs
+llama.cpp's stock policy and kernels.
 
 ## Quick start
 
-A few options to get `llama.cpp` installed on your machine:
+**Requirements.** A phone with a Snapdragon 8 Elite (Hexagon v79) or Snapdragon 8 Elite Gen 5 (Hexagon v81); Tandem
+was tested on a OnePlus 13T and a OnePlus 15, and root access is not needed. The build also produces libraries for v73
+and v75, which were not tested. A Qwen3.5 model with its multi-token prediction (MTP) layer, and optionally its vision
+tower (`mmproj`); tested: Qwen3.5 2B, 4B and 9B. On other hybrid models (tested: LFM2, Granite 4.0-H) the checkpoint
+policy and idle power release apply, while the Gated DeltaNet kernels and the MTP mechanisms do not.
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+**Build** exactly like llama.cpp for Snapdragon, with the toolchain container that includes the Android NDK and the
+Hexagon SDK ([docs/backend/snapdragon](docs/backend/snapdragon/README.md)). This installs `llama-server` and its
+libraries to `/data/local/tmp/llama.cpp` on the connected phone:
 
-Once installed:
-
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
-
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+```bash
+./scripts/snapdragon/build.py --target adb --push
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+**Prepare a model.** Convert the Hugging Face checkpoint with `convert_hf_to_gguf.py`, which keeps the MTP layer,
+quantize it (for example to Q4_K_M with `llama-quantize`), and add the trimmed draft head. The corpus, prompts and
+answers of your workload, chooses which tokens the head can draft; without it, the tool takes the special, byte and
+most common CJK tokens and then the lowest token ids.
 
-## Description
+```bash
+python tools/tandem/make_draft_head.py model-Q4_K_M.gguf model-Q4_K_M-dh.gguf \
+    --tokenizer tokenizer.json --corpus my_prompts_and_answers.jsonl
+```
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+**Run** on the phone, then send the agent's requests to the OpenAI-compatible endpoint (`/v1/chat/completions`) as you
+would to `llama-server`:
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+```bash
+cd /data/local/tmp/llama.cpp
+LD_LIBRARY_PATH=$PWD/lib ./bin/llama-server -m model-Q4_K_M-dh.gguf --mmproj mmproj.gguf \
+    --device HTP0 --mmproj-device HTP0 -ngl 99 -t 4 -tb 4 \
+    --ctx-size 8192 --ctx-checkpoints 8 --cache-ram 512 --no-warmup \
+    --spec-type draft-mtp --agent-checkpoints --port 8080
+```
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+**Notes.**
 
-## Supported backends
+- `--agent-checkpoints` is meant for stateless clients that send the whole prompt at every step, as agents do. A chat
+  client still gets correct answers, but it resumes from an earlier checkpoint.
+- Bound the prompt cache (`--cache-ram`): llama.cpp's default of 8 GiB can exhaust a phone's memory.
+- Requests that ask for log-probabilities make the server compute full-vocabulary probabilities, which costs time on
+  every generated token without speculation.
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+## License
 
-## Documentation
-
-#### Tools
-
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
-
-#### Development
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+MIT, like llama.cpp; Tandem's changes are released under the same license. Tandem is built on llama.cpp and its
+Hexagon backend; upstream's README is in [README-llama.cpp.md](README-llama.cpp.md).
