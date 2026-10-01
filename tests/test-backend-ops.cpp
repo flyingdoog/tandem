@@ -11131,6 +11131,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
 
+    // Prefill-sized batches (HMX matmul + SWIGLU epilogue on Hexagon; m > 32 takes its pipelined loop)
+    for (int64_t m_batch : {16, 33, 448}) {
+        for (int64_t rows : {4100, 9216}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, m_batch, rows, 2560,
+                false, 16, 8, false, false, true, false, { 1, 1 }));
+        }
+    }
+
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
             for (bool bias_probs : {false, true}) {

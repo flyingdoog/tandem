@@ -34,6 +34,9 @@
 #else
 #    include <semaphore.h>
 #    include <unistd.h>
+#    include <sys/epoll.h>
+#    include <sys/eventfd.h>
+#    include <sys/timerfd.h>
 #endif
 
 #pragma clang diagnostic ignored "-Wnested-anon-types"
@@ -96,6 +99,13 @@ static int    opt_etm     = 0;
 static int    opt_verbose = 0;
 static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
 static bool   opt_hostbuf = false;
+static int    opt_pwr     = 1;     // extra NPU power votes (GGML_HEXAGON_PWR): 1 = DDR performance mode, -1 = off
+static int    opt_pwr_bw  = 0;     // explicit bus bandwidth vote in MB/s for opt_pwr bit 2
+static int    opt_watchdog = 60;   // abort when an op batch gets no NPU response for this many seconds (0 = wait forever)
+static int    opt_idle_ms  = 3000; // relax the NPU power votes after this many ms without op batches (0 = off), see pwr_loop
+static int    opt_idle_log = 0;    // 1 = log each relax / restore as WARN (default INFO, shown with -lv 4)
+static int    opt_chanfast = 16;   // channel-fastest Gated DeltaNet conv input from this many tokens on (0 = off)
+static int    opt_tandem_off = 0;  // turn off Tandem's kernel paths (GGML_HEXAGON_TANDEM_OFF bitmask): 1 small-batch (verification) matmul + host crossover/prefetch, 2 rollback-aware GDN prefill, 4 conv-state CONCAT gather, 8 conv-state CPY gather, 16 MUL_MAT_NX+SWIGLU fusion (host only)
 static bool   opt_dma64   = false;
 
 static int    opt_mm_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
@@ -121,6 +131,7 @@ enum ggml_hexagon_fusion_flags {
     GGML_HEXAGON_FUSE_MUL_MAT_NX    = (1 << 4), // 16
     GGML_HEXAGON_FUSE_MUL_MAT_ID_NX = (1 << 5), // 32
     GGML_HEXAGON_FUSE_GDN_CPY       = (1 << 6), // 64
+    GGML_HEXAGON_FUSE_MUL_MAT_NX_SWIGLU = (1 << 7), // 128
 };
 
 static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
@@ -149,6 +160,17 @@ static const char * status_to_str(uint32_t status) {
         default:
             return "UNKNOWN";
     }
+}
+
+// time base of the idle power release: counts suspend time, same clock as its timer
+static int64_t ggml_hexagon_boottime_us() {
+#ifndef _WIN32
+    struct timespec ts;
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    return (int64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+#else
+    return ggml_time_us();
+#endif
 }
 
 // ** debug helpers
@@ -385,6 +407,13 @@ static void ggml_hexagon_precompute_fused_mmidnx_params(
     struct htp_mm_kernel_params * kparams
 );
 
+static bool ggml_hexagon_precompute_fused_mmnx_swiglu_params(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    struct htp_mm_kernel_params * kparams
+);
+
 static bool ggml_hexagon_precompute_allreduce_params(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * dst,
@@ -527,6 +556,29 @@ struct ggml_hexagon_session {
     void flush_batch(size_t min_ops = 1);
     void flush_peers();
     void flush_pending(bool all = true);
+
+    // Idle power release (GGML_HEXAGON_IDLE_MS): pwr_loop() relaxes the DSP power votes when no op batch was submitted
+    // or answered for opt_idle_ms and none is in flight; pwr_wake() restores them before the next batch is submitted.
+    // pwr_mtx serializes the relax / restore RPCs and the relaxed state with the batch submission.
+    std::mutex           pwr_mtx;
+    std::thread          pwr_thread;
+    std::atomic<int64_t> pwr_last_us{0};       // CLOCK_BOOTTIME of the last batch submit or response
+    bool                 pwr_on      = false;  // idle thread started (set and read by the thread that owns the session)
+    bool                 pwr_relaxed = false;  // pwr_mtx
+    bool                 pwr_stop    = false;  // pwr_mtx
+    bool                 pwr_alarm   = false;  // the idle timer can wake the system from suspend
+    int                  pwr_tfd     = -1;     // idle timer
+    int                  pwr_efd     = -1;     // wakes pwr_loop (re-arm after a restore, stop)
+    int                  pwr_epfd    = -1;
+    uint32_t             pwr_n_relax = 0, pwr_n_restore = 0, pwr_n_err = 0;                          // pwr_mtx
+    int64_t              pwr_t0 = 0, pwr_relax_t = 0, pwr_relaxed_us = 0, pwr_restore_us = 0, pwr_restore_max_us = 0;
+
+    void pwr_start();
+    void pwr_end();
+    void pwr_close();
+    void pwr_wake();
+    void pwr_loop();
+    bool pwr_set(bool relax);
 
     ggml_hexagon_shared_buffer * mmap_tensor(const ggml_tensor * t);
     bool clone_buffer(const ggml_hexagon_shared_buffer*);
@@ -3334,6 +3386,97 @@ struct ggml_hexagon_opbatch {
         return true;
     }
 
+    // SWIGLU(gate, up) right after the HMX MUL_MAT_NX that makes gate and up, and the only reader of both:
+    // the HMX epilogue writes silu(gate) * up, and gate / up are never written.
+    bool try_fuse_mul_mat_nx_swiglu(const htp_opnode & node) {
+        if (n_ops == 0 || node.opcode != HTP_OP_GLU_SWIGLU || (opt_tandem_off & 16)) return false;
+
+        htp_opnode & last_node = ops[n_ops - 1];
+        if (last_node.opcode != HTP_OP_MUL_MAT_NX || last_node.inputs.size() != 3 || last_node.outputs.size() != 2) return false;
+
+        const auto * nx_kparams = (const struct htp_mm_kernel_params *) last_node.kernel_params;
+        if (!nx_kparams->n_hmx || nx_kparams->kernel_type != HTP_MM_KERNEL_HMX_2D || nx_kparams->n_weights != 2) return false;
+
+        const ggml_tensor * glu  = node.node;
+        const ggml_tensor * gate = glu->src[0];
+        const ggml_tensor * up   = glu->src[1];
+        if (!gate || !up || ggml_get_op_params_i32(glu, 1) != 0) return false;  // split form only, not swapped
+
+        int ig;  // index of the gate result in the NX op
+        if (gate == last_node.outputs[0] && up == last_node.outputs[1]) {
+            ig = 0;
+        } else if (gate == last_node.outputs[1] && up == last_node.outputs[0]) {
+            ig = 1;
+        } else {
+            return false;
+        }
+
+        // one use each (this SWIGLU), no views, not graph outputs
+        if (!ggml_hexagon_tensor_is_fuseable(gate) || !ggml_hexagon_tensor_is_fuseable(up)) return false;
+
+        const ggml_tensor * w_gate = last_node.inputs[ig];
+        const ggml_tensor * w_up   = last_node.inputs[1 - ig];
+        const ggml_tensor * x      = last_node.inputs[2];
+
+        if (glu->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32) return false;
+        if (!ggml_are_same_shape(gate, glu) || !ggml_are_same_shape(up, glu)) return false;
+        if (!ggml_is_contiguous(glu) || !ggml_is_contiguous(gate) || !ggml_is_contiguous(up)) return false;
+        if (w_gate->type != w_up->type || w_gate->ne[0] != w_up->ne[0] || w_gate->ne[1] != w_up->ne[1] || w_gate->nb[1] != w_up->nb[1]) return false;
+        if (glu->ne[0] != w_gate->ne[1] || glu->ne[1] * glu->ne[2] * glu->ne[3] != x->ne[1] * x->ne[2] * x->ne[3]) return false;
+
+        struct htp_mm_kernel_params kparams;
+        if (!ggml_hexagon_precompute_fused_mmnx_swiglu_params(sess, w_gate, x, &kparams)) return false;
+        if ((size_t) kparams.vtcm_size > sess->vtcm_size) {
+            HEX_VERBOSE("ggml-hex: %s skip NX+SWIGLU fusion: VTCM needed (%d) > budget (%zu)\n", sess->c_name(), kparams.vtcm_size, sess->vtcm_size);
+            return false;
+        }
+        if (kparams.m_chunk < nx_kparams->m_chunk || kparams.pipeline != nx_kparams->pipeline) {
+            HEX_VERBOSE("ggml-hex: %s skip NX+SWIGLU fusion: more row blocks (m %d->%d)\n", sess->c_name(), nx_kparams->m_chunk, kparams.m_chunk);
+            return false;
+        }
+
+        // x is read at the start of every row block and dst is written after it: they may share memory only when
+        // there is one row block on one device
+        const int64_t m = x->ne[1] * x->ne[2] * x->ne[3];
+        if (ggml_hexagon_tensors_overlap(glu, x) && (m > kparams.m_chunk || sess->mdev.count > 1)) {
+            HEX_VERBOSE("ggml-hex: %s skip NX+SWIGLU fusion: dst overlaps x\n", sess->c_name());
+            return false;
+        }
+
+        if (!try_fuse_common({glu})) {
+            return false;
+        }
+
+        last_node.opcode = HTP_OP_MUL_MAT_NX_SWIGLU;
+        last_node.name   = "MUL_MAT_NX+SWIGLU";
+        last_node.inputs.clear();
+        last_node.inputs.push_back(w_gate);
+        last_node.inputs.push_back(w_up);
+        last_node.inputs.push_back(x);
+        last_node.outputs.clear();
+        last_node.outputs.push_back(glu);
+        last_node.fused.push_back(node.node);
+        memcpy(last_node.kernel_params, &kparams, sizeof(kparams));
+
+        htp_op_desc & o = h_ops[n_ops - 1];
+        o.opcode = HTP_OP_MUL_MAT_NX_SWIGLU;
+        memcpy(o.kernel_params, &kparams, sizeof(kparams));
+
+        o.src[0] = add_tensor(w_gate);
+        o.src[1] = add_tensor(w_up);
+        o.src[2] = add_tensor(x);
+        for (uint32_t s = 3; s < HTP_OP_MAX_INPUTS; s++) {
+            o.src[s] = 0xffff;
+        }
+        o.dst[0] = add_tensor(glu);
+        for (uint32_t d = 1; d < HTP_OP_MAX_OUTPUTS; d++) {
+            o.dst[d] = 0xffff;
+        }
+
+        HEX_VERBOSE("ggml-hex: %s fused MUL_MAT_NX+SWIGLU (#%u, mc %d nc %d)\n", sess->c_name(), n_ops - 1, kparams.m_chunk, kparams.n_chunk);
+        return true;
+    }
+
     bool try_fuse(const htp_opnode & node) {
         if (!opt_opfusion) return false;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_ALLREDUCE_ADD) && try_fuse_allreduce_add(node)) return true;
@@ -3342,6 +3485,7 @@ struct ggml_hexagon_opbatch {
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_NX)    && try_fuse_mul_mat_nx(node))    return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ID_NX) && try_fuse_mul_mat_id_nx(node)) return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_GDN_CPY)       && try_fuse_gdn_cpy(node))       return true;
+        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_NX_SWIGLU) && try_fuse_mul_mat_nx_swiglu(node)) return true;
         return false;
     }
 };
@@ -3552,6 +3696,7 @@ void ggml_hexagon_session::flush_pending(bool all) {
         }
     }
 
+    auto wait_start = std::chrono::steady_clock::now();
     while (this->batch_rsp_seq < this->batch_req_seq) {
         struct htp_opbatch_rsp rsp;
         uint32_t               rsp_size;
@@ -3564,9 +3709,17 @@ void ggml_hexagon_session::flush_pending(bool all) {
         const uint32_t timeo = opt_oppoll ? 0 : DSPQUEUE_TIMEOUT;
 
         int err = dspqueue_read(this->queue, &flags, 1, &n_dbufs, &dbuf, sizeof(rsp), &rsp_size, (uint8_t *) &rsp, timeo);
-        if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK) {
+        if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK || err == AEE_EINTERRUPTED) {
+            // AEE_EINTERRUPTED: host-side wait interrupted, the response is still pending. A response that never
+            // comes means the DSP is stuck: fail loudly (the process can be restarted) instead of waiting forever.
+            if (opt_watchdog > 0 && std::chrono::steady_clock::now() - wait_start > std::chrono::seconds(opt_watchdog)) {
+                GGML_ABORT("ggml-hex: %s no NPU response for %d s (op batch %llu of %llu): DSP hang\n", this->c_name(),
+                           opt_watchdog, (unsigned long long) this->batch_rsp_seq + 1,
+                           (unsigned long long) this->batch_req_seq);
+            }
             continue;
         }
+        wait_start = std::chrono::steady_clock::now();
 
         if (err != 0) {
             GGML_ABORT("ggml-hex: dspqueue_read failed: 0x%08x\n", (unsigned) err);
@@ -3588,6 +3741,9 @@ void ggml_hexagon_session::flush_pending(bool all) {
         op_queue->pop(rsp, dbuf);
 
         GGML_ASSERT(rsp.seq == this->batch_rsp_seq + 1);
+        if (this->pwr_on) {
+            this->pwr_last_us = ggml_hexagon_boottime_us();  // before batch_rsp_seq: pwr_loop never sees a done batch with an older time
+        }
         this->batch_rsp_seq = rsp.seq;
 
         if (!all) break;
@@ -3636,7 +3792,12 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
 
         HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", sub->c_name(), sub_dbuf.ptr, sub_dbuf.size);
 
-        int err = dspqueue_write(sub->queue, 0, 1, &sub_dbuf, sizeof(sub_req), (const uint8_t*) &sub_req, DSPQUEUE_TIMEOUT);
+        sub->pwr_wake();
+
+        int err;
+        do {
+            err = dspqueue_write(sub->queue, 0, 1, &sub_dbuf, sizeof(sub_req), (const uint8_t*) &sub_req, DSPQUEUE_TIMEOUT);
+        } while (err == AEE_EINTERRUPTED);
         if (err != 0) {
             GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", sub->c_name(), (unsigned) err);
         }
@@ -3644,7 +3805,12 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
 
     HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", this->c_name(), dbuf.ptr, dbuf.size);
 
-    int err = dspqueue_write(this->queue, 0, 1, &dbuf, sizeof(req), (const uint8_t*) &req, DSPQUEUE_TIMEOUT);
+    this->pwr_wake();  // after batch_req_seq was incremented: pwr_loop sees this batch as in flight from here on
+
+    int err;
+    do {
+        err = dspqueue_write(this->queue, 0, 1, &dbuf, sizeof(req), (const uint8_t*) &req, DSPQUEUE_TIMEOUT);
+    } while (err == AEE_EINTERRUPTED);
     if (err != 0) {
         GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
     }
@@ -4023,6 +4189,201 @@ static size_t ggml_hexagon_measure_max_vmem(ggml_hexagon_session *sess) {
     return vmem - step; // backoff to account for overhead from internal mappings
 }
 
+// ** idle power release (GGML_HEXAGON_IDLE_MS)
+//
+// The session votes max clocks with DCVS and all DSP low-power modes off (htp_iface_start, htp_iface_power), so the
+// cDSP never power-collapses while the model is loaded. pwr_loop() sends "relax" once no op batch was submitted or
+// answered for opt_idle_ms and none is in flight; pwr_wake() sends "restore" (replay of the original requests) before
+// the next batch is written. Both RPCs run under pwr_mtx: a batch is never written while relaxed or during a relax, and
+// a relax never starts while a batch is in flight (batch_req_seq grows before pwr_wake, batch_rsp_seq after the response).
+
+static void ggml_hexagon_fd_signal(int fd) {
+#ifndef _WIN32
+    const uint64_t one = 1;
+    ssize_t r = write(fd, &one, sizeof(one));
+    (void) r;
+#else
+    (void) fd;
+#endif
+}
+
+void ggml_hexagon_session::pwr_close() {
+#ifndef _WIN32
+    for (int * fd : { &pwr_tfd, &pwr_efd, &pwr_epfd }) {
+        if (*fd >= 0) {
+            close(*fd);
+            *fd = -1;
+        }
+    }
+#endif
+}
+
+void ggml_hexagon_session::pwr_start() {
+#ifndef _WIN32
+    // CLOCK_BOOTTIME_ALARM (needs CAP_WAKE_ALARM) wakes the system from suspend at the deadline; CLOCK_BOOTTIME fires
+    // at the first wakeup after it
+    pwr_tfd   = timerfd_create(CLOCK_BOOTTIME_ALARM, TFD_NONBLOCK | TFD_CLOEXEC);
+    pwr_alarm = pwr_tfd >= 0;
+    if (!pwr_alarm) {
+        pwr_tfd = timerfd_create(CLOCK_BOOTTIME, TFD_NONBLOCK | TFD_CLOEXEC);
+    }
+    pwr_efd  = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    pwr_epfd = epoll_create1(EPOLL_CLOEXEC);
+
+    // EPOLLWAKEUP (needs CAP_BLOCK_SUSPEND, else ignored): no suspend from the timer expiry until the relax is done
+    struct epoll_event et = {};
+    et.events  = EPOLLIN | EPOLLWAKEUP;
+    et.data.fd = pwr_tfd;
+    struct epoll_event ee = {};
+    ee.events  = EPOLLIN;
+    ee.data.fd = pwr_efd;
+
+    bool ok = pwr_tfd >= 0 && pwr_efd >= 0 && pwr_epfd >= 0 && epoll_ctl(pwr_epfd, EPOLL_CTL_ADD, pwr_tfd, &et) == 0 &&
+              epoll_ctl(pwr_epfd, EPOLL_CTL_ADD, pwr_efd, &ee) == 0;
+    const int err = ok ? 0 : errno;
+    if (ok) {
+        pwr_t0      = ggml_hexagon_boottime_us();
+        pwr_last_us = pwr_t0;
+        try {
+            pwr_thread = std::thread([this] { pwr_loop(); });
+        } catch (const std::exception &) {
+            ok = false;
+        }
+    }
+    if (!ok) {
+        GGML_LOG_WARN("ggml-hex: %s idle power release not available (errno %d): the NPU power votes stay on\n", this->c_name(), err);
+        pwr_close();
+        return;
+    }
+    pwr_on = true;
+    GGML_LOG_WARN("ggml-hex: %s idle power release: relax the NPU power votes after %d ms without op batches (GGML_HEXAGON_IDLE_MS, 0 = off), wake alarm %s\n",
+                  this->c_name(), opt_idle_ms, pwr_alarm ? "on" : "off");
+#endif
+}
+
+void ggml_hexagon_session::pwr_end() {
+#ifndef _WIN32
+    if (pwr_thread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(pwr_mtx);
+            pwr_stop = true;
+        }
+        ggml_hexagon_fd_signal(pwr_efd);
+        pwr_thread.join();
+    }
+    if (pwr_on) {
+        const int64_t now        = ggml_hexagon_boottime_us();
+        const int64_t relaxed_us = pwr_relaxed_us + (pwr_relaxed ? now - pwr_relax_t : 0);
+        GGML_LOG_WARN("ggml-hex: %s idle power release: %u relax, %u restore (mean %.2f ms, max %.2f ms), relaxed %.1f of %.1f s, %u errors\n",
+                      this->c_name(), pwr_n_relax, pwr_n_restore, pwr_n_restore ? pwr_restore_us / 1e3 / pwr_n_restore : 0.0,
+                      pwr_restore_max_us / 1e3, relaxed_us / 1e6, (now - pwr_t0) / 1e6, pwr_n_err);
+        pwr_on = false;
+    }
+    pwr_close();
+#endif
+}
+
+// relax or restore the DSP power votes; the caller holds pwr_mtx. Returns false when the relax RPC failed.
+bool ggml_hexagon_session::pwr_set(bool relax) {
+    int32_t r_hmx = 0, r_clk = 0, r_bw = 0, r_dcvs = 0, r_us = 0;
+    const uint32_t mode = HTP_PWR_IDLE | (relax ? 1u : 0u);
+    const int64_t  t0   = ggml_hexagon_boottime_us();
+    const int      err  = htp_iface_power(this->handle, mode, 0, &r_hmx, &r_clk, &r_bw, &r_dcvs, &r_us);
+    const int64_t  t1   = ggml_hexagon_boottime_us();
+
+    if (err != 0 || r_dcvs != 0 || r_hmx != 0 || r_bw != 0) {
+        pwr_n_err++;
+        GGML_LOG_WARN("ggml-hex: %s idle power %s: error 0x%x (dcvs %d hmx %d bw %d)\n", this->c_name(), relax ? "relax" : "restore",
+                      (unsigned) err, r_dcvs, r_hmx, r_bw);
+    }
+    if (relax && err != 0) {
+        // DSP state unknown: put the session votes back and stop relaxing
+        htp_iface_power(this->handle, HTP_PWR_IDLE, 0, &r_hmx, &r_clk, &r_bw, &r_dcvs, &r_us);
+        pwr_relaxed = false;
+        GGML_LOG_WARN("ggml-hex: %s idle power release stopped: the NPU power votes stay on\n", this->c_name());
+        return false;
+    }
+
+    const ggml_log_level level = opt_idle_log ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO;
+    const unsigned       core  = (unsigned) r_clk & 0xffff;
+    const unsigned       hmx   = (unsigned) r_clk >> 16;
+    if (relax) {
+        pwr_relaxed = true;
+        pwr_relax_t = t1;
+        pwr_n_relax++;
+        ggml_log_internal(level, "ggml-hex: %s idle power: relax #%u after %.2f s idle: rpc %.2f ms, dsp %d us, clocks before core %u MHz hmx %u MHz\n",
+                          this->c_name(), pwr_n_relax, (t0 - pwr_last_us) / 1e6, (t1 - t0) / 1e3, r_us, core, hmx);
+    } else {
+        pwr_relaxed = false;
+        pwr_n_restore++;
+        pwr_relaxed_us    += t0 - pwr_relax_t;
+        pwr_restore_us    += t1 - t0;
+        pwr_restore_max_us = std::max(pwr_restore_max_us, t1 - t0);
+        ggml_log_internal(level, "ggml-hex: %s idle power: restore #%u after %.2f s relaxed: rpc %.2f ms, dsp %d us, clocks core %u MHz hmx %u MHz\n",
+                          this->c_name(), pwr_n_restore, (t0 - pwr_relax_t) / 1e6, (t1 - t0) / 1e3, r_us, core, hmx);
+    }
+    return true;
+}
+
+// before an op batch is written to the queue: restore the votes if relaxed (waits for a running relax)
+void ggml_hexagon_session::pwr_wake() {
+#ifndef _WIN32
+    if (!pwr_on) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(pwr_mtx);
+    pwr_last_us = ggml_hexagon_boottime_us();
+    if (pwr_relaxed) {
+        pwr_set(false);
+        ggml_hexagon_fd_signal(pwr_efd);  // re-arm the idle timer
+    }
+#endif
+}
+
+void ggml_hexagon_session::pwr_loop() {
+#ifndef _WIN32
+    const int64_t idle_us = (int64_t) opt_idle_ms * 1000;
+
+    std::unique_lock<std::mutex> lock(pwr_mtx);
+    while (!pwr_stop) {
+        struct itimerspec its = {};  // zero = disarmed (while relaxed)
+        if (!pwr_relaxed) {
+            // a batch written to the queue passed pwr_wake (this mutex) after its batch_req_seq increment, so it counts
+            // as in flight until its response is read; rsp_seq is read first and before pwr_last_us (see flush_pending)
+            const uint64_t rsp  = this->batch_rsp_seq.load();
+            const bool     busy = rsp < this->batch_req_seq.load();
+            const int64_t  now  = ggml_hexagon_boottime_us();
+            const int64_t  due  = pwr_last_us.load() + idle_us;
+            if (!busy && now >= due) {
+                if (!pwr_set(true)) {
+                    break;
+                }
+                continue;
+            }
+            const int64_t wait_us = busy ? idle_us : due - now;
+            its.it_value.tv_sec   = (time_t) (wait_us / 1000000);
+            its.it_value.tv_nsec  = (long) (wait_us % 1000000) * 1000;
+        }
+        timerfd_settime(pwr_tfd, 0, &its, nullptr);
+        lock.unlock();
+
+        struct epoll_event ev[2];
+        const int n = epoll_wait(pwr_epfd, ev, 2, -1);
+        const int e = errno;
+        uint64_t  v;
+        ssize_t   r = read(pwr_tfd, &v, sizeof(v));
+        r = read(pwr_efd, &v, sizeof(v));
+        (void) r;
+
+        lock.lock();
+        if (n < 0 && e != EINTR) {
+            GGML_LOG_WARN("ggml-hex: %s idle power release stopped: epoll_wait errno %d\n", this->c_name(), e);
+            break;  // a relaxed session is still restored by pwr_wake
+        }
+    }
+#endif
+}
+
 void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) noexcept(false) {
     int phys_idx = config.physical_idx;
     int virt_idx = config.virtual_idx;
@@ -4228,6 +4589,18 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     }
     this->valid_iface = true;
 
+    // bits 16-19 carry GGML_HEXAGON_TANDEM_OFF to the DSP, bit 31 = store the switches only, no power votes
+    // (TANDEM_OFF bit 16, the SWIGLU fusion switch, is host only and is not sent)
+    const int tandem_off_dsp = opt_tandem_off & 15;
+    if (opt_pwr >= 0 || tandem_off_dsp) {
+        int32_t r_prot = 0, r_ddr = 0, r_bus = 0, r_dcvs = 0, r_bw = 0;
+        const uint32_t mode = (uint32_t) (opt_pwr >= 0 ? opt_pwr : 0) | ((uint32_t) tandem_off_dsp << 16) |
+                              (opt_pwr < 0 ? 0x80000000u : 0u);
+        err = htp_iface_power(this->handle, mode, (uint32_t) opt_pwr_bw, &r_prot, &r_ddr, &r_bus, &r_dcvs, &r_bw);
+        GGML_LOG_INFO("ggml-hex: %s power votes mode %d bw %d MB/s: err 0x%x protected-corners %d ddr-perf %d bus-perf %d dcvs %d bw %d\n",
+                      this->c_name(), opt_pwr, opt_pwr_bw, (unsigned) err, r_prot, r_ddr, r_bus, r_dcvs, r_bw);
+    }
+
     if (opt_profile) {
         htp_iface_pmu_conf pmu_conf{};
         std::copy(opt_pmu_evt.begin(), opt_pmu_evt.end(), pmu_conf.events);
@@ -4237,10 +4610,16 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
             GGML_LOG_ERROR("ggml-hex: failed to enable profiling: 0x%08x\n", (unsigned) err);
         }
     }
+
+    if (opt_idle_ms > 0) {
+        pwr_start();
+    }
 }
 
 void ggml_hexagon_session::release() noexcept(true) {
     GGML_LOG_INFO("ggml-hex: releasing session: %s\n", this->name.c_str());
+
+    pwr_end();
 
     this->mdev.sessions.clear();
 
@@ -4619,6 +4998,21 @@ static bool ggml_hexagon_supported_gated_delta_net(const struct ggml_hexagon_ses
     return true;
 }
 
+// Largest activation row count that stays on HVX (small-batch rt kernels), per weight type
+#define HTP_MM_HVX_SMALL_NROWS 8
+
+static int ggml_hexagon_hvx_max_nrows(int wtype) {
+    if (opt_tandem_off & 1) return HTP_MM_HMX_MIN_NROWS;
+    switch (wtype) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K: return 5;
+        case GGML_TYPE_Q6_K: return 8;
+        default:             return HTP_MM_HMX_MIN_NROWS;
+    }
+}
+
 static bool ggml_hexagon_matmul_is_hmx_eligible(
     const struct ggml_tensor * src0,
     const struct ggml_tensor * src1,
@@ -4664,7 +5058,7 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
     // M alignment: Use HMX when M > HTP_MM_HMX_MIN_NROWS.
     // For MUL_MAT_ID, src1 shape is [K, n_expert_used, n_tokens, 1], so n_tokens is ne12.
     const int m = is_matmul_id ? ne12 : ne11;
-    if (m <= HTP_MM_HMX_MIN_NROWS) {
+    if (m <= ggml_hexagon_hvx_max_nrows(wtype)) {
         return false;
     }
 
@@ -4787,7 +5181,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
             kparams->src1_row_size = (wtype == GGML_TYPE_Q4_1 || wtype == GGML_TYPE_Q4_K) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
 
             struct htp_mm_hvx_vtcm_layout L;
-            uint32_t max_prefetch = (src1_nrows > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
+            uint32_t max_prefetch = (src1_nrows > ((opt_tandem_off & 1) ? HTP_MM_HMX_MIN_NROWS : HTP_MM_HVX_SMALL_NROWS)) ? 2 : 16;
             uint32_t best_n_prefetch = 2;
             for (uint32_t d = max_prefetch; d >= 2; d /= 2) {
                 htp_mm_hvx_vtcm_layout_build(
@@ -4822,7 +5216,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
                 }
 
                 struct htp_mm_hvx_vtcm_layout L;
-                uint32_t max_prefetch = (src1_nrows > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
+                uint32_t max_prefetch = (src1_nrows > ((opt_tandem_off & 1) ? HTP_MM_HMX_MIN_NROWS : HTP_MM_HVX_SMALL_NROWS)) ? 2 : 16;
                 uint32_t best_n_prefetch = 2;
                 for (uint32_t d = max_prefetch; d >= 2; d /= 2) {
                     htp_mm_hvx_vtcm_layout_build(
@@ -5346,6 +5740,42 @@ static void ggml_hexagon_precompute_ssm_conv_params(
     kparams->src1_row_size_aligned = hex_round_up(d_conv * sizeof(float), 128);
     kparams->dst_row_size_aligned  = hex_round_up(d_inner * sizeof(float), 128);
 
+    // chanfast conv input (rows of d_inner floats, see chanfast_concat_eligible): two (d_conv-1 + t_chunk)-row input
+    // windows and two t_chunk-row output buffers per thread (+ one row for silu), t_chunk as large as VTCM allows (<= 64)
+    const bool chanfast = src0->nb[1] == sizeof(float) && src0->nb[0] == (size_t) d_inner * sizeof(float);  // only the rewrite makes this
+    if (chanfast) {
+        const uint32_t row  = d_inner_per_thread * sizeof(float);
+        const uint32_t halo = d_conv - 1;
+        const uint32_t src1_raw_bytes = hex_round_up(d_inner_per_thread * d_conv * sizeof(float), 128) + 128;
+        const uint32_t src1_T_bytes   = hex_round_up(d_conv * d_inner_per_thread * sizeof(float), 128);
+        const uint32_t vtcm_src1_per_thread = src1_raw_bytes + src1_T_bytes;
+
+        const size_t budget = (sess->vtcm_size > 0 ? sess->vtcm_size / n_threads : (1024 * 1024));
+        const size_t fixed  = (size_t) vtcm_src1_per_thread + (size_t) 2 * halo * row + row;
+        uint32_t t_chunk = budget > fixed ? (uint32_t) ((budget - fixed) / (4 * (size_t) row)) : 0;
+        t_chunk = std::min<uint32_t>(t_chunk, 64);
+        t_chunk = std::max<uint32_t>(std::min<uint32_t>(t_chunk, n_t), 1);  // the layout requires this kernel
+        {
+            kparams->chanfast = 1;
+            kparams->t_chunk  = t_chunk;
+            kparams->d_inner_tile = d_inner_per_thread;
+
+            const uint32_t vtcm_src0_per_thread = 2 * (halo + t_chunk) * row;
+            const uint32_t vtcm_dst_per_thread  = (2 * t_chunk + 1) * row;
+
+            kparams->vtcm_src0_size_per_thread = vtcm_src0_per_thread;
+            kparams->vtcm_src1_size_per_thread = vtcm_src1_per_thread;
+            kparams->vtcm_dst_size_per_thread  = vtcm_dst_per_thread;
+
+            kparams->vtcm_src0_size = vtcm_src0_per_thread * n_threads;
+            kparams->vtcm_src1_size = vtcm_src1_per_thread * n_threads;
+            kparams->vtcm_dst_size  = vtcm_dst_per_thread  * n_threads;
+            kparams->vtcm_size      = kparams->vtcm_src0_size + kparams->vtcm_src1_size + kparams->vtcm_dst_size;
+            kparams->div_n_threads  = init_fastdiv_values(n_threads);
+            return;
+        }
+    }
+
     if (n_t == 1) {
         kparams->d_inner_tile = d_inner_per_thread;
 
@@ -5529,7 +5959,7 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
         uint32_t best_n_prefetch = 16;
 
         if (is_repack) {
-            const uint32_t max_prefetch = (src1_nrows > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
+            const uint32_t max_prefetch = (src1_nrows > ((opt_tandem_off & 1) ? HTP_MM_HMX_MIN_NROWS : HTP_MM_HVX_SMALL_NROWS)) ? 2 : 16;
             best_n_prefetch = 2;
             for (uint32_t d = max_prefetch; d >= 2; d /= 2) {
                 struct htp_mm_hvx_vtcm_layout L;
@@ -5585,6 +6015,59 @@ static void ggml_hexagon_precompute_fused_mmidnx_params(
 ) {
     ggml_hexagon_precompute_matmul_params_impl(sess, src0, src1, dst, 0, 0, kparams);
     kparams->n_weights = n_weights;
+}
+
+// MUL_MAT_NX + SWIGLU (HMX 2D only): one HMX job holds n_chunk / 2 columns of the gate and of the up weight,
+// so solve the chunks for 2 x N columns and keep n_chunk a multiple of 64
+static bool ggml_hexagon_precompute_fused_mmnx_swiglu_params(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * src0, // gate weight (the up weight has the same type and shape)
+    const struct ggml_tensor * src1, // x
+    struct htp_mm_kernel_params * kparams
+) {
+    memset(kparams, 0, sizeof(*kparams));
+
+    const int ne00 = src0->ne[0];
+    const int ne01 = src0->ne[1];
+    const int ne02 = src0->ne[2];
+    const int ne03 = src0->ne[3];
+
+    const int ne11 = src1->ne[1];
+    const int ne12 = src1->ne[2];
+    const int ne13 = src1->ne[3];
+
+    const int wtype = src0->type;
+    const bool is_repack = ggml_hexagon_is_repack_type((ggml_type) wtype);
+    const int ne00_padded = is_repack ? hex_round_up(ne00, 32) : ne00;
+    const int ne01_padded = is_repack ? hex_round_up(ne01, 32) : ne01;
+    const int ne11_padded = hex_round_up(ne11, 32);
+    const bool is_batched = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
+
+    if (sess->n_hmx == 0 || opt_mm_select < 2 || !ggml_hexagon_matmul_is_hmx_eligible(src0, src1, nullptr, ne01_padded, false, is_batched)) {
+        return false;
+    }
+    if (!ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, nullptr, wtype, ne00_padded, 2 * ne01_padded, ne02, ne11, ne12, ne11_padded,
+                                               false, is_batched, 0, sess->vtcm_size, kparams)) {
+        return false;
+    }
+    if (kparams->kernel_type != HTP_MM_KERNEL_HMX_2D) {
+        return false;
+    }
+
+    kparams->n_chunk = (kparams->n_chunk / 64) * 64;
+    if (kparams->n_chunk < 64) {
+        return false;
+    }
+    kparams->vtcm_size = (int32_t) htp_mm_hmx_get_2d_vtcm_size(wtype, ne00_padded, kparams->m_chunk, kparams->n_chunk, kparams->pipeline,
+                                                               kparams->n_act_threads, kparams->aligned_tile_size, 0);
+    kparams->n_weights = 2;
+
+    kparams->div_ne12_ne1 = init_fastdiv_values(ne12 * ne11);
+    kparams->div_ne1      = init_fastdiv_values(ne11);
+    kparams->div_r2       = init_fastdiv_values(ne02 > 0 ? ne12 / ne02 : 1);
+    kparams->div_r3       = init_fastdiv_values(ne03 > 0 ? ne13 / ne03 : 1);
+    kparams->div_ne12     = init_fastdiv_values(ne12);
+    return true;
 }
 
 static bool ggml_hexagon_tensor_is_host(const struct ggml_hexagon_session * sess, const struct ggml_tensor * t) {
@@ -6573,6 +7056,119 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
     return true;
 }
 
+// ---- chanfast: channel-fastest Gated DeltaNet conv input (GGML_HEXAGON_CHANFAST) ----
+// delta-net-base build_conv_state: conv_input = CONCAT(conv_state [k-1, C, ns] (time fastest), transpose(x [C, n, ns]),
+// dim 0); K tail windows VIEW(conv_input) -> CPY into the state cache; SSM_CONV(conv_input, w [k, C]) -> SILU. The
+// CONCAT transposes x into time-fastest rows and the SSM_CONV transposes them back. For prefill-sized batches the HTP
+// backend stores conv_input channel-fastest instead (same bytes; row t = C floats): the CONCAT and every reader get a
+// descriptor with nb[0] = C*4, nb[1] = 4, so each op stays correct for the tensor it is handed (the DSP picks the
+// copy-only CONCAT and the streaming SSM_CONV from those strides). Only done when nothing else reads conv_input.
+
+// VIEW node vi of t is a whole [k-1, C, ns] time window of it that only CPYs read
+static bool chanfast_window_ok(const ggml_cgraph * graph, int vi, const ggml_tensor * t) {
+    const ggml_tensor * v = graph->nodes[vi];
+    if (v->op != GGML_OP_VIEW || v->src[0] != t || v->type != GGML_TYPE_F32 || v->ne[3] != 1) {
+        return false;
+    }
+    if (v->ne[0] != t->src[0]->ne[0] || v->ne[1] != t->ne[1] || v->ne[2] != t->ne[2]) {
+        return false;
+    }
+    if (v->nb[0] != sizeof(float) || v->nb[1] != t->nb[1] || (v->ne[2] > 1 && v->nb[2] != t->nb[2])) {
+        return false;
+    }
+    if (v->view_offs % sizeof(float) != 0 || v->view_offs / sizeof(float) + v->ne[0] > (size_t) t->ne[0]) {
+        return false;
+    }
+    for (int j = vi + 1; j < graph->n_nodes; j++) {
+        const ggml_tensor * n = graph->nodes[j];
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (n->src[s] == v && !(n->op == GGML_OP_CPY && s == 0)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool chanfast_concat_eligible(const ggml_cgraph * graph, int i) {
+    const ggml_tensor * t = graph->nodes[i];
+    if (opt_chanfast <= 0 || t->op != GGML_OP_CONCAT || ggml_get_op_params_i32(t, 0) != 0) {
+        return false;
+    }
+    const ggml_tensor * s0 = t->src[0];
+    const ggml_tensor * s1 = t->src[1];
+    if (!s0 || !s1 || t->type != GGML_TYPE_F32 || s0->type != GGML_TYPE_F32 || s1->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || t->ne[3] != 1 || !ggml_is_contiguous(t)) {
+        return false;
+    }
+    const int64_t C = t->ne[1];
+    if (s0->ne[0] < 1 || s0->ne[0] > 8 || s0->ne[1] != C || s1->ne[1] != C || s0->ne[2] != t->ne[2] || s1->ne[2] != t->ne[2]) {
+        return false;
+    }
+    if (s0->nb[0] != sizeof(float) || s0->nb[1] != (size_t) s0->ne[0] * sizeof(float)) {
+        return false;  // conv state: time fastest, packed
+    }
+    if (s1->nb[1] != sizeof(float) || s1->nb[0] < (size_t) C * sizeof(float) || s1->ne[0] < opt_chanfast) {
+        return false;  // tokens: transposed channel-fastest x, prefill-sized batch
+    }
+    int n_conv = 0;
+    for (int j = i + 1; j < graph->n_nodes; j++) {
+        const ggml_tensor * n = graph->nodes[j];
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            const ggml_tensor * src = n->src[s];
+            if (!src) {
+                continue;
+            }
+            if (src == t) {
+                if (n->op == GGML_OP_SSM_CONV && s == 0 && n->src[1] && n->src[1]->ne[0] == s0->ne[0] + 1) {
+                    n_conv++;
+                    continue;
+                }
+                if (chanfast_window_ok(graph, j, t)) {
+                    continue;
+                }
+                return false;
+            }
+            if (src->view_src == t && !(n->op == GGML_OP_CPY && s == 0 && src->op == GGML_OP_VIEW && src->src[0] == t)) {
+                return false;
+            }
+        }
+    }
+    return n_conv == 1;
+}
+
+// re-describe inputs that are (windows of) a chanfast conv_input
+static void chanfast_remap_inputs(htp_opnode & node, const std::unordered_map<const ggml_tensor *, const ggml_tensor *> & chanfast) {
+    for (auto & in : node.inputs) {
+        if (!in) {
+            continue;
+        }
+        auto it = chanfast.find(in);
+        if (it != chanfast.end()) {
+            in = it->second;
+            continue;
+        }
+        if (in->op != GGML_OP_VIEW || !in->view_src) {
+            continue;
+        }
+        auto jt = chanfast.find(in->view_src);
+        if (jt == chanfast.end()) {
+            continue;
+        }
+        const ggml_tensor * cf    = jt->second;
+        const size_t        s_idx = in->view_offs / sizeof(float);
+        ggml_tensor v = *in;
+        v.data  = (char *) cf->data + s_idx * cf->nb[0];
+        v.nb[0] = cf->nb[0];
+        v.nb[1] = sizeof(float);
+        v.nb[2] = cf->nb[2];
+        v.nb[3] = cf->nb[2] * in->ne[2];
+        in = node.add_dummy(v);
+    }
+}
+
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
 
@@ -6609,6 +7205,9 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
         computed_nodes.reserve(graph->n_nodes);
 
+        std::unordered_map<const ggml_tensor *, const ggml_tensor *> chanfast;  // conv_input -> channel-fastest view
+        int last_ssm_conv = -1;                                                 // graph index of the last SSM_CONV
+
         for (int i = 0; i < graph->n_nodes; ++i) {
             ggml_tensor * n = graph->nodes[i];
             if (!op_is_compute(n)) {
@@ -6617,6 +7216,40 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
             htp_opnode node(HTP_OP_INVALID, n);
             node.opcode = op_remap_to_htp(n);
+
+            if (!chanfast.empty()) {
+                chanfast_remap_inputs(node, chanfast);
+            }
+            if (node.opcode == HTP_OP_CONCAT && chanfast_concat_eligible(graph, i)) {
+                ggml_tensor tc = *n;
+                tc.nb[0] = (size_t) n->ne[1] * sizeof(float);
+                tc.nb[1] = sizeof(float);
+                tc.nb[2] = (size_t) n->ne[0] * n->ne[1] * sizeof(float);
+                tc.nb[3] = tc.nb[2] * n->ne[2];
+                const ggml_tensor * cf = node.add_dummy(tc);
+                node.outputs[0] = cf;
+                node.name += "(chanfast)";
+                chanfast[n] = cf;
+            }
+            // SILU of a chanfast SSM_CONV result that nothing else reads: folded into the conv
+            if (node.opcode == HTP_OP_UNARY_SILU && last_ssm_conv >= 0 && !computed_nodes.empty()) {
+                htp_opnode & prev = computed_nodes.back();
+                auto * kp = (struct htp_ssm_conv_kernel_params *) prev.kernel_params;
+                if (prev.opcode == HTP_OP_SSM_CONV && kp->chanfast && !kp->silu && n->src[0] == prev.node &&
+                    prev.outputs.size() == 1 && prev.outputs[0] == prev.node && n->type == GGML_TYPE_F32 &&
+                    ggml_are_same_shape(n, prev.node) && ggml_is_contiguous(n) && ggml_is_contiguous(prev.node) &&
+                    ggml_node_has_n_uses(graph, last_ssm_conv, 1)) {
+                    prev.outputs[0] = n;
+                    prev.fused.push_back(n);
+                    prev.name += "+SILU";
+                    kp->silu = 1;
+                    continue;
+                }
+            }
+            if (node.opcode == HTP_OP_SSM_CONV) {
+                last_ssm_conv = i;
+            }
+
             if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID) {
                 ggml_hexagon_precompute_matmul_params(sess,
                     node.node->src[0], node.node->src[1], node.node,
@@ -6657,7 +7290,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                 );
             } else if (node.opcode == HTP_OP_SSM_CONV) {
                 ggml_hexagon_precompute_ssm_conv_params(sess,
-                    node.node->src[0], node.node->src[1], node.dst(),
+                    node.inputs[0], node.node->src[1], node.dst(),
                     (struct htp_ssm_conv_kernel_params *)node.kernel_params
                 );
             } else if (node.opcode == HTP_OP_SOFTMAX) {
@@ -7997,7 +8630,12 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_mbuf     = getenv("GGML_HEXAGON_MBUF");
     const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
+    const char * str_pwr      = getenv("GGML_HEXAGON_PWR");
+    const char * str_chanfast = getenv("GGML_HEXAGON_CHANFAST");
+    const char * str_watchdog = getenv("GGML_HEXAGON_WATCHDOG");
     const char * str_dma64    = getenv("GGML_HEXAGON_DMA64");
+    const char * str_tandem_off = getenv("GGML_HEXAGON_TANDEM_OFF");
+    const char * str_idle_ms  = getenv("GGML_HEXAGON_IDLE_MS");
 
     // Init Arch first since it affects other defaults
     if (!str_arch) {
@@ -8047,6 +8685,26 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf) != 0                 : opt_hostbuf;
+    opt_chanfast  = str_chanfast ? atoi(str_chanfast)                     : opt_chanfast;
+    opt_watchdog  = str_watchdog ? atoi(str_watchdog)                     : opt_watchdog;
+    opt_tandem_off = str_tandem_off ? (atoi(str_tandem_off) & 31)         : opt_tandem_off;
+    if (str_pwr) {
+        opt_pwr = atoi(str_pwr);
+        const char * c = strchr(str_pwr, ',');
+        opt_pwr_bw = c ? atoi(c + 1) * 1000 : 0;
+    }
+    if (str_idle_ms) {  // <ms>[,<log>]: log 1 = one WARN line per relax / restore
+        opt_idle_ms = std::max(0, atoi(str_idle_ms));
+        const char * c = strchr(str_idle_ms, ',');
+        opt_idle_log = c ? atoi(c + 1) : 0;
+    }
+#ifdef _WIN32
+    opt_idle_ms = 0;  // pwr_loop uses timerfd / epoll
+#endif
+    if (opt_tandem_off) {
+        GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_TANDEM_OFF=%d (small-batch matmul %d, gdn-rollback-prefill %d, concat-gather %d, cpy-gather %d, swiglu-fusion %d off)\n",
+                      opt_tandem_off, opt_tandem_off & 1, !!(opt_tandem_off & 2), !!(opt_tandem_off & 4), !!(opt_tandem_off & 8), !!(opt_tandem_off & 16));
+    }
 
     // Parse device configuration
     const char * str_devices  = getenv("GGML_HEXAGON_DEVICES");

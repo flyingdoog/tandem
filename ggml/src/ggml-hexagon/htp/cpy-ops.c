@@ -362,6 +362,81 @@ static inline void cpy_dma_sametype_sameshape(
     dma_queue_flush(dma_q);
 }
 
+// same-type f32 copy of short rows with a fixed row stride into a contiguous destination
+// (e.g. conv-state write-back: [3, C] view with 16-byte rows -> [3C]): one DMA in, vgather compaction, one DMA out
+#define HTP_CPY_GATHER_MAX_NE0 16
+
+static void cpy_thread_gather_rows_f32(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_copy_context * ct = (struct htp_copy_context *) data;
+    struct htp_ops_context * octx = ct->octx;
+
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * dst  = octx->dst;
+
+    const uint32_t ne00  = src0->ne[0];
+    const uint32_t nb01  = src0->nb[1];
+    const uint32_t nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const uint32_t per   = ct->src0_nrows_per_thread;
+    const uint32_t r0    = ith * per;
+    if (r0 >= nrows) {
+        return;
+    }
+    const uint32_t nr = MIN(per, nrows - r0);
+
+    dma_queue * dma_q = octx->ctx->dma[ith];
+    uint8_t * spad = octx->src0_spad.data + ith * octx->src0_spad.size_per_thread;
+    const uint32_t in_bytes = (nr - 1) * nb01 + ne00 * sizeof(float);
+    uint8_t * vin = spad;
+    HVX_Vector * vout = (HVX_Vector *) (spad + hex_round_up(per * nb01, VLEN));
+
+    // the offset pattern repeats every P vectors = 32 * P / ne00 rows
+    uint32_t P = ne00;
+    while ((32 * P) % ne00) P++;
+    for (uint32_t q = 1; q <= ne00; q++) {
+        if ((32 * q) % ne00 == 0) { P = q; break; }
+    }
+    const uint32_t rows_per_period = 32 * P / ne00;
+    int32_t offs[HTP_CPY_GATHER_MAX_NE0][32] __attribute__((aligned(128)));
+    for (uint32_t v = 0; v < P; v++) {
+        for (uint32_t l = 0; l < 32; l++) {
+            const uint32_t o = v * 32 + l;
+            offs[v][l] = (o / ne00) * nb01 + (o % ne00) * sizeof(float);
+        }
+    }
+    const HVX_Vector v_period = Q6_V_vsplat_R(rows_per_period * nb01);
+    const uint32_t mu = in_bytes - 1;
+    const uint32_t n_vec = (nr * ne00 + 31) / 32;
+
+    dma_queue_push_single_1d(dma_q, dma_make_data(vin, src0->data + (size_t) r0 * nb01), in_bytes);
+    dma_queue_pop(dma_q);
+
+    HVX_Vector v_base = Q6_V_vzero();
+    for (uint32_t k = 0; k < n_vec; k++) {
+        const uint32_t v = k % P;
+        if (k && v == 0) {
+            v_base = Q6_Vw_vadd_VwVw(v_base, v_period);
+        }
+        Q6_vgather_ARMVw(&vout[k], (size_t) vin, mu, Q6_Vw_vadd_VwVw(v_base, *(const HVX_Vector *) offs[v]));
+    }
+    // wait for the gathers before the DMA reads their destination (see concat_dim0_gather_f32)
+    for (uint32_t k = 0; k < n_vec; k++) {
+        (void) *(volatile HVX_Vector *) &vout[k];
+    }
+
+    dma_queue_push_single_1d(dma_q, dma_make_data(dst->data + (size_t) r0 * ne00 * sizeof(float), vout), nr * ne00 * sizeof(float));
+    dma_queue_pop(dma_q);
+}
+
+// The paths below that read src0 through the data cache (not by DMA) first clean + invalidate its range with QuRT: a
+// source an earlier op wrote by DMA (e.g. the chanfast conv input, whose state window this op copies) can still have
+// stale lines in the cache, which the dirty-range flush (dccleaninva) does not remove. Without it, small
+// prefill batches saved the previous layer's conv state.
+static void cpy_invalidate_src(const struct htp_tensor * src0) {
+    if (src0->size && !htp_tensor_is_extended(src0)) {
+        qurt_mem_cache_clean((qurt_addr_t) src0->data, src0->size, QURT_MEM_CACHE_FLUSH_INVALIDATE, QURT_MEM_DCACHE);
+    }
+}
+
 static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
     cpy_preamble;
     *use_dma = false;
@@ -453,8 +528,25 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
             } else {
                 return HTP_STATUS_NO_SUPPORT;
             }
+            cpy_invalidate_src(src0);
             work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);
         }
+    } else if (!(octx->ctx->tandem_off & 8) && sametype && ct.src0_type_size == 4 && ne00 <= HTP_CPY_GATHER_MAX_NE0 && nb00 == 4 && nb01 > ne00 * 4 &&
+               nb02 == ne01 * nb01 && nb03 == ne02 * nb02 && dst_is_contiguous && octx->ctx->mdev.count <= 1 &&
+               !htp_tensor_is_extended(src0) && !htp_tensor_is_extended(dst) &&
+               (uint64_t) ne01 * ne02 * ne03 * nb01 <= octx->ctx->vtcm_size / 2) {
+        const uint32_t nrows = ne01 * ne02 * ne03;
+        ct.src0_nrows_per_thread = hex_round_up((nrows + n_threads - 1) / n_threads, 32);
+        octx->src0_spad.size_per_thread = hex_round_up(ct.src0_nrows_per_thread * nb01, VLEN) +
+                                          hex_round_up(ct.src0_nrows_per_thread * ne00 * 4, VLEN) + 2 * VLEN;
+        octx->src0_spad.size = n_threads * octx->src0_spad.size_per_thread;
+        if (octx->src0_spad.size > octx->ctx->vtcm_size) {
+            return HTP_STATUS_VTCM_TOO_SMALL;
+        }
+        octx->src0_spad.data = octx->ctx->vtcm_base;
+        octx->src0_spad.src  = NULL;
+        *use_dma = true;
+        work_queue_run(octx->ctx->work_queue, cpy_thread_gather_rows_f32, &ct, n_threads);
     } else if (sametype) {
         const uint32_t total_elems = ne0 * ne1 * ne2 * ne3;
         const uint32_t elems_per_line = (ct.dst_type_size == 4) ? 32 : 64;
@@ -498,6 +590,7 @@ static int exec_cpy(struct htp_ops_context * octx, bool * use_dma) {
             case HTP_TYPE_I32: copy_fun = cpy_thread_i32_reshape; break;
             default: return HTP_STATUS_NO_SUPPORT;
         }
+        cpy_invalidate_src(src0);
         work_queue_run(octx->ctx->work_queue, copy_fun, &ct, n_threads);
     } else {
         return HTP_STATUS_NO_SUPPORT;

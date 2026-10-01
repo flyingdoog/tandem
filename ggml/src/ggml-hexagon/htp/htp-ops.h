@@ -108,6 +108,7 @@ enum htp_op_code {
     HTP_OP_GLU_SWIGLU_CLAMP,
     HTP_OP_MDEV_GROUP,
     HTP_OP_ROLL,
+    HTP_OP_MUL_MAT_NX_SWIGLU,   // MUL_MAT_NX (gate, up) + SWIGLU in the HMX epilogue: src[0] gate, src[1] up, src[2] x
 
     HTP_OP_INVALID
 };
@@ -127,6 +128,10 @@ enum htp_op_code {
 #define HTP_OP_MAX_VMEM_DEFAULT (3355443200u)
 
 #define HTP_MMAP_MAX_VMEM  (2147483648u)
+
+// htp_iface_power() mode bit: idle power request (GGML_HEXAGON_IDLE_MS), bit 0 = 1 relax, 0 restore;
+// other bits ignored
+#define HTP_PWR_IDLE       (0x40000000u)
 
 enum htp_tensor_flags {
     HTP_TENSOR_WEIGHT  = (1U << 0), // Tensor buffer model weight data (not compute)

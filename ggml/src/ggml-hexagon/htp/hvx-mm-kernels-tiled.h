@@ -1,6 +1,6 @@
 // Dynamic quantizers that produce tiled activations
 
-static inline void quantize_block_f32_q8_1_tiled(float * restrict x, uint8_t * restrict y_block) {
+static inline void quantize_block_f32_q8_1_tiled(float * restrict x, uint8_t * restrict y_block, uint8_t * restrict rt) {
     assert((unsigned long) x % 128 == 0);
     assert((unsigned long) y_block % 128 == 0);
 
@@ -41,6 +41,9 @@ static inline void quantize_block_f32_q8_1_tiled(float * restrict x, uint8_t * r
     HVX_Vector vx01_i16 = hvx_vec_i16_from_hf_rnd_sat(vx01_hf);
     HVX_Vector vx23_i16 = hvx_vec_i16_from_hf_rnd_sat(vx23_hf);
     HVX_Vector vx_i8    = Q6_Vb_vpack_VhVh_sat(vx23_i16, vx01_i16);
+    if (rt) {
+        *(HVX_Vector *) rt = vx_i8;
+    }
 
     const HVX_Vector ones = Q6_Vb_vsplat_R(1);
     HVX_Vector v_sums = Q6_Vw_vrmpy_VbVb(vx_i8, ones);
@@ -114,7 +117,7 @@ static inline void quantize_block_f32_q8_1_tiled(float * restrict x, uint8_t * r
     }
 }
 
-static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * restrict y_block) {
+static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * restrict y_block, uint8_t * restrict rt) {
     assert((unsigned long) x % 128 == 0);
     assert((unsigned long) y_block % 128 == 0);
 
@@ -155,6 +158,9 @@ static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * r
     HVX_Vector vx01_i16 = hvx_vec_i16_from_hf_rnd_sat(vx01_hf);
     HVX_Vector vx23_i16 = hvx_vec_i16_from_hf_rnd_sat(vx23_hf);
     HVX_Vector vx_i8    = Q6_Vb_vpack_VhVh_sat(vx23_i16, vx01_i16);
+    if (rt) {
+        *(HVX_Vector *) rt = vx_i8;
+    }
 
     HVX_VectorPair vp01 = Q6_W_vshuff_VVR(vd01_hf, vd01_hf, -64);
     HVX_VectorPair vp23 = Q6_W_vshuff_VVR(vd23_hf, vd23_hf, -64);
@@ -207,25 +213,25 @@ static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * r
     }
 }
 
-static void quantize_row_f32_q8_0_tiled(float * restrict x, uint8_t * restrict y, uint32_t k) {
+static void quantize_row_f32_q8_0_tiled(float * restrict x, uint8_t * restrict y, uint32_t k, uint8_t * restrict rt) {
     assert(k % 32 == 0);
     const uint32_t qk = QK_Q8_0_TILED;
     const uint32_t nb = (k + qk - 1) / qk;
 
     for (uint32_t i = 0; i < nb; i++) {
         uint8_t * restrict y_block = y + i * 4 * 1152;
-        quantize_block_f32_q8_0_tiled(x + i * qk, y_block);
+        quantize_block_f32_q8_0_tiled(x + i * qk, y_block, rt ? rt + i * qk : NULL);
     }
 }
 
-static void quantize_row_f32_q8_1_tiled(float * restrict x, uint8_t * restrict y, uint32_t k) {
+static void quantize_row_f32_q8_1_tiled(float * restrict x, uint8_t * restrict y, uint32_t k, uint8_t * restrict rt) {
     assert(k % 32 == 0);
     const uint32_t qk = QK_Q8_0_TILED;
     const uint32_t nb = (k + qk - 1) / qk;
 
     for (uint32_t i = 0; i < nb; i++) {
         uint8_t * restrict y_block = y + i * 4 * 1280;
-        quantize_block_f32_q8_1_tiled(x + i * qk, y_block);
+        quantize_block_f32_q8_1_tiled(x + i * qk, y_block, rt ? rt + i * qk : NULL);
     }
 }
 
@@ -1134,11 +1140,12 @@ static inline void quantize_f32_q8_0_tiled_kernel(
     size_t src_row_size,
     size_t dst_row_size
 ) {
-    (void) tmp_data;
+    uint8_t * restrict rt = tmp_data;
     for (uint32_t i = 0; i < nrows; ++i) {
-        quantize_row_f32_q8_0_tiled((float *) src_data, dst_data, ne0);
+        quantize_row_f32_q8_0_tiled((float *) src_data, dst_data, ne0, rt);
         dst_data += dst_row_size;
         src_data += src_row_size;
+        rt = rt ? rt + hex_round_up(ne0, QK_Q8_0_TILED) : NULL;
     }
 }
 
@@ -1151,11 +1158,12 @@ static inline void quantize_f32_q8_1_tiled_kernel(
     size_t src_row_size,
     size_t dst_row_size
 ) {
-    (void) tmp_data;
+    uint8_t * restrict rt = tmp_data;
     for (uint32_t i = 0; i < nrows; ++i) {
-        quantize_row_f32_q8_1_tiled((float *) src_data, dst_data, ne0);
+        quantize_row_f32_q8_1_tiled((float *) src_data, dst_data, ne0, rt);
         dst_data += dst_row_size;
         src_data += src_row_size;
+        rt = rt ? rt + hex_round_up(ne0, QK_Q8_0_TILED) : NULL;
     }
 }
 
@@ -1171,15 +1179,15 @@ static inline void quantize_f32_q8_0_tiled_block_kernel(
     uint32_t r,
     uint32_t c
 ) {
-    (void) tmp_data;
     const uint32_t qk = QK_Q8_0_TILED;
     const uint32_t nb = (ne0 + qk - 1) / qk;
 
     for (uint32_t ib = ib_first; ib < ib_last; ++ib) {
         const float * restrict src_ptr = (const float *) ((const uint8_t *) src + r * src_row_size + c * qk * sizeof(float));
         uint8_t * restrict dst_ptr = dst + r * dst_row_size + c * 4 * 1152;
+        uint8_t * restrict rt_ptr  = tmp_data ? tmp_data + r * hex_round_up(ne0, QK_Q8_0_TILED) + c * qk : NULL;
 
-        quantize_block_f32_q8_0_tiled((float *) src_ptr, dst_ptr);
+        quantize_block_f32_q8_0_tiled((float *) src_ptr, dst_ptr, rt_ptr);
 
         c++;
         if (c == nb) {
@@ -1201,15 +1209,15 @@ static inline void quantize_f32_q8_1_tiled_block_kernel(
     uint32_t r,
     uint32_t c
 ) {
-    (void) tmp_data;
     const uint32_t qk = QK_Q8_0_TILED;
     const uint32_t nb = (ne0 + qk - 1) / qk;
 
     for (uint32_t ib = ib_first; ib < ib_last; ++ib) {
         const float * restrict src_ptr = (const float *) ((const uint8_t *) src + r * src_row_size + c * qk * sizeof(float));
         uint8_t * restrict dst_ptr = dst + r * dst_row_size + c * 4 * 1280;
+        uint8_t * restrict rt_ptr  = tmp_data ? tmp_data + r * hex_round_up(ne0, QK_Q8_0_TILED) + c * qk : NULL;
 
-        quantize_block_f32_q8_1_tiled((float *) src_ptr, dst_ptr);
+        quantize_block_f32_q8_1_tiled((float *) src_ptr, dst_ptr, rt_ptr);
 
         c++;
         if (c == nb) {
@@ -1218,3 +1226,217 @@ static inline void quantize_f32_q8_1_tiled_block_kernel(
         }
     }
 }
+
+// Small-batch "rt" kernels (1..8 activation columns).
+// The q8 quantizers also write the plain int8 activations (act_rt, normal cached memory) when requested.
+// The kernels read 4 activation bytes at a time into a scalar register and use vrmpy(Vu.ub, Rt.b):
+// no replicated activation vectors are loaded, and one weight tile unpack is shared by all columns.
+// Scalar loads from VTCM are slow, so act_rt must not live in VTCM. Block scales still come from the tiled VTCM copy.
+// vrmpy(Vu.ub, Rt.b) needs unsigned weights: the q4_0 (8) and q6_k (32) biases are removed with activation block sums.
+
+#define HTP_MM_RT_MAX_COLS 8
+
+static inline void rt_store_32xn(uint32_t nc, float * restrict * s, const HVX_Vector * v, uint32_t valid_rows, const float * restrict * sz) {
+    for (uint32_t c = 0; c < nc; c++) {
+        HVX_Vector r = sz[c] ? hvx_vec_add_f32_f32(v[c], hvx_vmemu(sz[c])) : v[c];
+        hvx_vec_store_u(s[c], valid_rows * sizeof(float), r);
+    }
+}
+
+// sum of 16 signed bytes held in 4 words
+static inline int32_t rt_sum_i8x16(const int32_t * a) {
+    const int64_t ones = 0x0101010101010101LL;
+    int64_t p = Q6_P_vrmpybsu_PP(Q6_P_combine_RR(a[1], a[0]), ones);
+    p = Q6_P_vrmpybsuacc_PP(p, Q6_P_combine_RR(a[3], a[2]), ones);
+    return (int32_t) p + (int32_t) (p >> 32);
+}
+
+static inline void rt_load_act(const uint8_t * restrict yr, int32_t * aw) {
+    const int64_t * restrict p = (const int64_t *) yr;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int64_t v = p[i];
+        aw[2 * i + 0] = (int32_t) v;
+        aw[2 * i + 1] = (int32_t) (v >> 32);
+    }
+}
+
+// q4_1, q4_k (repacked as q4_1) and q5_k: scale + offset epilogue
+static inline HVX_Vector rt_scale_offset_32x1(HVX_Vector v_sum, HVX_Vector v_scale, HVX_Vector v_offset, const HVX_Vector * restrict v_act) {
+    HVX_Vector v_scale_comb  = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale, v_act[8]);
+    HVX_Vector v_offset_comb = hvx_vec_mul_f16_f16_to_f32_lower32(v_offset, v_act[9]);
+    return hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(v_sum), v_scale_comb), v_offset_comb);
+}
+
+// Q6_K group unpack without the -32 bias (0..63)
+static inline HVX_Vector unpack_q6_k_group_u(const HVX_Vector * restrict vptr, int g, HVX_Vector mask_0f, HVX_Vector mask_03) {
+    HVX_Vector v_lo = (g & 1) ? Q6_Vub_vlsr_VubR(vptr[g >> 1], 4) : Q6_V_vand_VV(vptr[g >> 1], mask_0f);
+    HVX_Vector v_hi = (g & 3) ? Q6_Vub_vlsr_VubR(vptr[4 + (g >> 2)], 2 * (g & 3)) : vptr[4 + (g >> 2)];
+    return Q6_V_vor_VV(v_lo, Q6_Vw_vasl_VwR(Q6_V_vand_VV(v_hi, mask_03), 4));
+}
+
+// q4_1 / q4_k (tile 640) and q5_k (tile 768) with q8_1 activations (1280 per k tile)
+static inline __attribute__((always_inline)) void rt_dot_q4_1_nc(const uint32_t n, const uint32_t nc, const int is_q5,
+        float * restrict * s, const void * restrict vx, const uint8_t * restrict * vy, const uint8_t * restrict * vyr,
+        uint32_t valid_rows, const float * restrict * sz) {
+    const uint8_t * restrict tile_ptr = vx;
+    const uint32_t tile_size = is_q5 ? 768 : 640;
+    const HVX_Vector mask_h4 = Q6_Vb_vsplat_R(0x0F);
+
+    HVX_Vector v_acc[HTP_MM_RT_MAX_COLS];
+    for (uint32_t c = 0; c < nc; c++) {
+        v_acc[c] = Q6_V_vzero();
+    }
+
+    const uint32_t n_k_tiles = n / 32;
+    for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
+        const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * tile_size);
+
+        HVX_Vector v_w[8];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            HVX_VectorPair p = is_q5 ? unpack_and_interleave_5bit_x2(vptr[i], vptr[5], i, mask_h4) : unpack_and_interleave_4bit_x2(vptr[i], mask_h4);
+            v_w[2 * i + 0] = Q6_V_lo_W(p);
+            v_w[2 * i + 1] = Q6_V_hi_W(p);
+        }
+        HVX_VectorPair p_deal = Q6_W_vdeal_VVR(vptr[4], vptr[4], -2);
+
+        #pragma unroll
+        for (uint32_t c = 0; c < nc; c++) {
+            int32_t aw[8];
+            rt_load_act(vyr[c] + kt * 32, aw);
+            HVX_Vector v_sum = Q6_V_vzero();
+            #pragma unroll
+            for (int g = 0; g < 8; g++) {
+                v_sum = Q6_Vw_vrmpyacc_VwVubRb(v_sum, v_w[g], aw[g]);
+            }
+            const HVX_Vector * restrict v_act = (const HVX_Vector *) (vy[c] + kt * 1280);
+            v_acc[c] = hvx_vec_add_f32_f32(v_acc[c], rt_scale_offset_32x1(v_sum, Q6_V_lo_W(p_deal), Q6_V_hi_W(p_deal), v_act));
+        }
+    }
+
+    rt_store_32xn(nc, s, v_acc, valid_rows, sz);
+}
+
+// q4_0 (tile 640) with q8_0 activations (1152 per k tile); weights 0..15, bias 8 removed with the block sum
+static inline __attribute__((always_inline)) void rt_dot_q4_0_nc(const uint32_t n, const uint32_t nc,
+        float * restrict * s, const void * restrict vx, const uint8_t * restrict * vy, const uint8_t * restrict * vyr,
+        uint32_t valid_rows, const float * restrict * sz) {
+    const uint8_t * restrict tile_ptr = vx;
+    const HVX_Vector mask_h4 = Q6_Vb_vsplat_R(0x0F);
+
+    HVX_Vector v_acc[HTP_MM_RT_MAX_COLS];
+    for (uint32_t c = 0; c < nc; c++) {
+        v_acc[c] = Q6_V_vzero();
+    }
+
+    const uint32_t n_k_tiles = n / 32;
+    for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
+        const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 640);
+
+        HVX_Vector v_w[8];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            HVX_VectorPair p = unpack_and_interleave_4bit_x2(vptr[i], mask_h4);
+            v_w[2 * i + 0] = Q6_V_lo_W(p);
+            v_w[2 * i + 1] = Q6_V_hi_W(p);
+        }
+        HVX_Vector v_scale_w = vptr[4];
+
+        #pragma unroll
+        for (uint32_t c = 0; c < nc; c++) {
+            int32_t aw[8];
+            rt_load_act(vyr[c] + kt * 32, aw);
+            HVX_Vector v_sum = Q6_V_vzero();
+            #pragma unroll
+            for (int g = 0; g < 8; g++) {
+                v_sum = Q6_Vw_vrmpyacc_VwVubRb(v_sum, v_w[g], aw[g]);
+            }
+            const int32_t sum_a = rt_sum_i8x16(aw) + rt_sum_i8x16(aw + 4);
+            v_sum = Q6_Vw_vsub_VwVw(v_sum, Q6_V_vsplat_R(8 * sum_a));
+
+            const HVX_Vector * restrict v_act = (const HVX_Vector *) (vy[c] + kt * 1152);
+            HVX_Vector v_scale_comb = hvx_vec_mul_f16_f16_to_f32_lower32(v_scale_w, v_act[8]);
+            v_acc[c] = hvx_vec_add_f32_f32(v_acc[c], hvx_vec_mul_f32_f32(Q6_Vsf_equals_Vw(v_sum), v_scale_comb));
+        }
+    }
+
+    rt_store_32xn(nc, s, v_acc, valid_rows, sz);
+}
+
+// q6_k (tile 896) with q8_0 activations; k 0..15 and k 16..31 have their own scale, bias 32 removed per half
+static inline __attribute__((always_inline)) void rt_dot_q6_k_nc(const uint32_t n, const uint32_t nc,
+        float * restrict * s, const void * restrict vx, const uint8_t * restrict * vy, const uint8_t * restrict * vyr,
+        uint32_t valid_rows, const float * restrict * sz) {
+    const uint8_t * restrict tile_ptr = vx;
+    const HVX_Vector mask_0f = Q6_Vb_vsplat_R(0x0F);
+    const HVX_Vector mask_03 = Q6_Vb_vsplat_R(0x03);
+
+    HVX_Vector v_acc[HTP_MM_RT_MAX_COLS];
+    for (uint32_t c = 0; c < nc; c++) {
+        v_acc[c] = Q6_V_vzero();
+    }
+
+    const uint32_t n_k_tiles = n / 32;
+    for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
+        const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 896);
+
+        HVX_Vector v_w[8];
+        #pragma unroll
+        for (int g = 0; g < 8; g++) {
+            v_w[g] = unpack_q6_k_group_u(vptr, g, mask_0f, mask_03);
+        }
+
+        #pragma unroll
+        for (uint32_t c = 0; c < nc; c++) {
+            int32_t aw[8];
+            rt_load_act(vyr[c] + kt * 32, aw);
+            HVX_Vector v_lo = Q6_V_vzero();
+            HVX_Vector v_hi = Q6_V_vzero();
+            #pragma unroll
+            for (int g = 0; g < 4; g++) {
+                v_lo = Q6_Vw_vrmpyacc_VwVubRb(v_lo, v_w[g],     aw[g]);
+                v_hi = Q6_Vw_vrmpyacc_VwVubRb(v_hi, v_w[g + 4], aw[g + 4]);
+            }
+            v_lo = Q6_Vw_vsub_VwVw(v_lo, Q6_V_vsplat_R(32 * rt_sum_i8x16(aw)));
+            v_hi = Q6_Vw_vsub_VwVw(v_hi, Q6_V_vsplat_R(32 * rt_sum_i8x16(aw + 4)));
+
+            const HVX_Vector * restrict v_act = (const HVX_Vector *) (vy[c] + kt * 1152);
+            v_acc[c] = hvx_vec_add_f32_f32(v_acc[c], scale_q6_k_32x1(Q6_W_vcombine_VV(v_hi, v_lo), vptr[6], v_act[8]));
+        }
+    }
+
+    rt_store_32xn(nc, s, v_acc, valid_rows, sz);
+}
+
+#define RT_DOT_DISPATCH(NAME, CALL)                                                                                   \
+static void NAME(uint32_t n, uint32_t nc, float * restrict * s, const void * restrict vx,                             \
+                 const uint8_t * restrict * vy, const uint8_t * restrict * vyr, uint32_t valid_rows,                  \
+                 const float * restrict * sz) {                                                                       \
+    switch (nc) {                                                                                                     \
+        case 8:  CALL(8); break;                                                                                      \
+        case 7:  CALL(7); break;                                                                                      \
+        case 6:  CALL(6); break;                                                                                      \
+        case 5:  CALL(5); break;                                                                                      \
+        case 4:  CALL(4); break;                                                                                      \
+        case 3:  CALL(3); break;                                                                                      \
+        case 2:  CALL(2); break;                                                                                      \
+        default: CALL(1); break;                                                                                      \
+    }                                                                                                                 \
+}
+
+#define RT_CALL_Q4_1(NC) rt_dot_q4_1_nc(n, NC, 0, s, vx, vy, vyr, valid_rows, sz)
+#define RT_CALL_Q5_K(NC) rt_dot_q4_1_nc(n, NC, 1, s, vx, vy, vyr, valid_rows, sz)
+#define RT_CALL_Q4_0(NC) rt_dot_q4_0_nc(n, NC, s, vx, vy, vyr, valid_rows, sz)
+#define RT_CALL_Q6_K(NC) rt_dot_q6_k_nc(n, NC, s, vx, vy, vyr, valid_rows, sz)
+
+RT_DOT_DISPATCH(rt_dot_q4_1, RT_CALL_Q4_1)
+RT_DOT_DISPATCH(rt_dot_q5_k, RT_CALL_Q5_K)
+RT_DOT_DISPATCH(rt_dot_q4_0, RT_CALL_Q4_0)
+RT_DOT_DISPATCH(rt_dot_q6_k, RT_CALL_Q6_K)
+
+// number of columns for the next rt kernel call
+static inline uint32_t rt_cols(uint32_t rem) {
+    return rem >= HTP_MM_RT_MAX_COLS ? HTP_MM_RT_MAX_COLS : rem;
+}
+

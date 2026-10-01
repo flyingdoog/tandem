@@ -28,6 +28,12 @@ struct htp_ssm_conv_kernel_params {
     uint32_t vtcm_dst_size;
     uint32_t vtcm_size;
 
+    // chanfast: src0 (the conv input) is channel-fastest ([ncs rows of d_inner], written by the chanfast CONCAT, see
+    // ggml-hexagon.cpp), t_chunk tokens per window step; silu: the SILU that follows is folded in (dst = silu(conv))
+    uint32_t chanfast;
+    uint32_t t_chunk;
+    uint32_t silu;
+
     struct fastdiv_values div_n_threads;
 };
 

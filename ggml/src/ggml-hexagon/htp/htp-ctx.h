@@ -10,6 +10,7 @@
 
 #include <assert.h>
 #include <dspqueue.h>
+#include <HAP_power.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -121,6 +122,17 @@ struct htp_context {
     void *                 main_stack;
     atomic_bool            killed;
     size_t                 footprint;
+
+    // Tandem's kernel paths turned off (GGML_HEXAGON_TANDEM_OFF bits, set by htp_iface_power), 0 = all on
+    // last member: keeps the offsets of all other members unchanged
+    uint32_t               tandem_off;
+
+    // Idle power release (GGML_HEXAGON_IDLE_MS, main.c htp_pwr_idle): copies of the session power requests as sent
+    // (0 DCVS_v3, 1 HMX, 2 mips_bw), replayed by "restore". Appended after tandem_off for the same reason.
+    HAP_power_request_t    pwr_req[3];
+    uint32_t               pwr_saved;    // bit i set: pwr_req[i] is valid
+    uint32_t               pwr_clk;      // core MHz | HMX MHz << 16, read just before the last relax
+    atomic_uint            pwr_idle;     // 1 while relaxed: htp_main_thread peeks with a longer timeout
 };
 
 static inline bool htp_ops_context_set_n_threads(struct htp_ops_context * octx, uint32_t n_threads) {
@@ -147,6 +159,7 @@ static inline void htp_ops_context_set_status(struct htp_ops_context * octx, int
 int op_matmul(struct htp_ops_context * octx);
 int op_matmul_id(struct htp_ops_context * octx);
 int op_matmul_nx(struct htp_ops_context * octx);
+int op_matmul_nx_swiglu(struct htp_ops_context * octx);
 int op_matmul_id_nx(struct htp_ops_context * octx);
 int op_binary(struct htp_ops_context * octx);
 int op_unary(struct htp_ops_context * octx);

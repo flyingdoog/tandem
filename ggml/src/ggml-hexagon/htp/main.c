@@ -514,6 +514,8 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
 #if (__HEXAGON_ARCH__ >= 79)
         HAP_set_dcvs_v3_protected_bus_corners(&request, 1);
 #endif
+        ctx->pwr_req[0] = request;  // replayed by the idle restore (htp_pwr_idle)
+        ctx->pwr_saved |= 1;
         if ((err = HAP_power_set((void *) ctx, &request)) != 0) {
             htp_iface_stop(handle);
             return err;
@@ -542,6 +544,8 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
         request.hmx_v2.max_corner    = HAP_DCVS_EXP_VCORNER_MAX;
         request.hmx_v2.perf_mode     = HAP_CLK_PERF_HIGH;
         FARF(ALWAYS, "Setting HMX clock\n");
+        ctx->pwr_req[1] = request;  // replayed by the idle restore (htp_pwr_idle)
+        ctx->pwr_saved |= 2;
         err = HAP_power_set((void *) ctx, &request);
         if (err != AEE_SUCCESS) {
             FARF(ERROR, "ggml-hex: error setting HMX clock.");
@@ -557,6 +561,8 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
         request.type         = HAP_power_set_HMX;
         request.hmx.power_up = TRUE;
         FARF(ALWAYS, "Powering HMX on\n");
+        ctx->pwr_req[1] = request;  // replayed by the idle restore (htp_pwr_idle)
+        ctx->pwr_saved |= 2;
         err = HAP_power_set((void *) ctx, &request);
         if (err != AEE_SUCCESS) {
             FARF(ERROR, "ggml-hex: error powering on HMX.");
@@ -665,6 +671,171 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
     free(ctx);
     h->ctx = NULL;
 
+    return AEE_SUCCESS;
+}
+
+#pragma weak HAP_power_get  // clocks are reported as 0 if the runtime lacks it
+
+// Core and HMX clocks in MHz: core | hmx << 16, 0 where the query fails
+static uint32_t htp_pwr_clocks(void) {
+    HAP_power_response_t rsp;
+    uint32_t core = 0;
+    uint32_t hmx  = 0;
+
+    if (!HAP_power_get) {
+        return 0;
+    }
+    memset(&rsp, 0, sizeof(rsp));
+    rsp.type = HAP_power_get_clk_Freq;
+    if (HAP_power_get(NULL, &rsp) == 0) {
+        core = rsp.clkFreqHz / 1000000;
+    }
+    memset(&rsp, 0, sizeof(rsp));
+    rsp.type = HAP_power_get_hmx_core_clk_Freq;
+    if (HAP_power_get(NULL, &rsp) == 0) {
+        hmx = rsp.clkFreqHz / 1000000;
+    }
+    return (core & 0xffff) | ((hmx & 0xffff) << 16);
+}
+
+// a clock read back after restore is still below the one read before the relax (0 = unknown, no wait)
+static inline bool htp_pwr_clk_low(uint32_t now, uint32_t before) {
+    const uint32_t c = now & 0xffff, h = now >> 16;
+    return (c && c < (before & 0xffff)) || (h && h < (before >> 16));
+}
+
+#define HTP_PWR_RESTORE_WAIT_US 2000
+#define HTP_PWR_PEEK_USEC       500000  // htp_main_thread queue peek timeout while relaxed (default 50000)
+
+// Idle power release (GGML_HEXAGON_IDLE_MS). The host sends it only while no op batch is in flight.
+// relax: SDK default votes (DCVS on, no core/bus clock votes, default sleep latency, all low-power modes allowed, no DDR
+// perf mode, no protected bus corners), HMX off without a clock vote, no bus bandwidth vote.
+// restore: replay the requests of htp_iface_start / htp_iface_power as they were sent, then wait (at most
+// HTP_PWR_RESTORE_WAIT_US) until the clocks read back at least the values read before the relax.
+// Out: HAP_power_set results (0 = ok or not sent), clocks (relax: before, restore: after), DSP time in us.
+static AEEResult htp_pwr_idle(struct htp_context * ctx, bool relax, int32_t * r_hmx, int32_t * r_clk,
+                              int32_t * r_bw, int32_t * r_dcvs, int32_t * r_usec) {
+    const uint64_t t0 = HAP_perf_get_time_us();
+    HAP_power_request_t request;
+
+    *r_hmx = *r_bw = *r_dcvs = 0;
+
+    if (relax) {
+        ctx->pwr_clk = htp_pwr_clocks();  // clocks under the session votes
+        *r_clk       = (int32_t) ctx->pwr_clk;
+    } else {
+        atomic_store(&ctx->pwr_idle, 0);
+    }
+
+    if (relax) {
+        if (ctx->pwr_saved & 4) {
+            memset(&request, 0, sizeof(request));
+            request.type               = HAP_power_set_mips_bw;
+            request.mips_bw.set_bus_bw = TRUE;  // 0 bytes/s: no bandwidth vote
+            *r_bw = HAP_power_set((void *) ctx, &request);
+        }
+
+        memset(&request, 0, sizeof(request));
+#if __HVX_ARCH__ >= 75
+        request.type             = HAP_power_set_HMX_v2;
+        request.hmx_v2.set_power = TRUE;
+        request.hmx_v2.power_up  = FALSE;
+        request.hmx_v2.set_clock = TRUE;  // clock fields 0: no HMX clock vote
+#else
+        request.type         = HAP_power_set_HMX;
+        request.hmx.power_up = FALSE;
+#endif
+        *r_hmx = HAP_power_set((void *) ctx, &request);
+
+        HAP_power_set_dcvs_v3_init(&request);  // SDK: removes the applied dcvs_v3 params and restores the defaults
+        HAP_set_dcvs_v3_protected_bus_corners(&request, 0);
+        HAP_set_ddr_perf_mode(&request, 0);
+        *r_dcvs = HAP_power_set((void *) ctx, &request);
+    } else {
+        if (ctx->pwr_saved & 1) {
+            request = ctx->pwr_req[0];
+            *r_dcvs = HAP_power_set((void *) ctx, &request);
+        }
+        if (ctx->pwr_saved & 2) {
+            request = ctx->pwr_req[1];
+            *r_hmx  = HAP_power_set((void *) ctx, &request);
+        }
+        if (ctx->pwr_saved & 4) {
+            request = ctx->pwr_req[2];
+            *r_bw   = HAP_power_set((void *) ctx, &request);
+        }
+
+        uint32_t clk = htp_pwr_clocks();
+        while (htp_pwr_clk_low(clk, ctx->pwr_clk) && HAP_perf_get_time_us() - t0 < HTP_PWR_RESTORE_WAIT_US) {
+            clk = htp_pwr_clocks();
+        }
+        *r_clk = (int32_t) clk;
+    }
+
+    if (relax) {
+        atomic_store(&ctx->pwr_idle, 1);
+    }
+
+    *r_usec = (int32_t) (HAP_perf_get_time_us() - t0);
+    return AEE_SUCCESS;
+}
+
+AEEResult htp_iface_power(remote_handle64 handle, uint32_t mode, uint32_t bw_mbps, int32_t * r_protected, int32_t * r_ddr_perf,
+                          int32_t * r_bus_perf, int32_t * r_dcvs, int32_t * r_bw) {
+    struct htp_handle * h = (struct htp_handle *) handle;
+    if (!h || !h->ctx) {
+        return AEE_EBADPARM;
+    }
+    struct htp_context * ctx = h->ctx;
+
+    if (mode & HTP_PWR_IDLE) {  // leaves tandem_off and the saved requests unchanged
+        return htp_pwr_idle(ctx, (mode & 1) != 0, r_protected, r_ddr_perf, r_bus_perf, r_dcvs, r_bw);
+    }
+
+    ctx->tandem_off = (mode >> 16) & 15;
+    if (mode & 0x80000000u) {  // GGML_HEXAGON_PWR=-1: no power votes (upstream), only store the switches
+        *r_protected = *r_ddr_perf = *r_bus_perf = *r_dcvs = *r_bw = -1;
+        return AEE_SUCCESS;
+    }
+
+    HAP_power_request_t request;
+    memset(&request, 0, sizeof(request));
+    request.type                              = HAP_power_set_DCVS_v3;
+    request.dcvs_v3.set_dcvs_enable           = TRUE;
+    request.dcvs_v3.dcvs_enable               = FALSE;
+    request.dcvs_v3.set_bus_params            = TRUE;
+    request.dcvs_v3.bus_params.min_corner     = HAP_DCVS_VCORNER_MAX;
+    request.dcvs_v3.bus_params.max_corner     = HAP_DCVS_VCORNER_MAX;
+    request.dcvs_v3.bus_params.target_corner  = HAP_DCVS_VCORNER_MAX;
+    request.dcvs_v3.set_core_params           = TRUE;
+    request.dcvs_v3.core_params.min_corner    = HAP_DCVS_VCORNER_MAX;
+    request.dcvs_v3.core_params.max_corner    = HAP_DCVS_VCORNER_MAX;
+    request.dcvs_v3.core_params.target_corner = HAP_DCVS_VCORNER_MAX;
+    request.dcvs_v3.set_sleep_disable         = TRUE;
+    request.dcvs_v3.sleep_disable             = TRUE;
+
+    *r_protected = HAP_set_dcvs_v3_protected_bus_corners(&request, 1);
+    *r_ddr_perf  = (mode & 1) ? HAP_set_ddr_perf_mode(&request, 1) : -1;
+    *r_bus_perf  = (mode & 2) ? HAP_set_dcvs_v3_bus_perf_mode(&request, HAP_DCVS_CLK_PERF_HIGH) : -1;
+    const HAP_power_request_t sent = request;
+    *r_dcvs      = HAP_power_set((void *) ctx, &request);
+    if (*r_dcvs == 0) {
+        ctx->pwr_req[0] = sent;  // this request replaces the one of htp_iface_start
+    }
+
+    *r_bw = -1;
+    if (mode & 4) {
+        memset(&request, 0, sizeof(request));
+        request.type                         = HAP_power_set_mips_bw;
+        request.mips_bw.set_bus_bw           = TRUE;
+        request.mips_bw.bwBytePerSec         = (uint64_t) (bw_mbps ? bw_mbps : 80000) * 1000000ULL;
+        request.mips_bw.busbwUsagePercentage = 100;
+        ctx->pwr_req[2] = request;
+        *r_bw = HAP_power_set((void *) ctx, &request);
+        if (*r_bw == 0) {
+            ctx->pwr_saved |= 4;
+        }
+    }
     return AEE_SUCCESS;
 }
 
@@ -831,6 +1002,9 @@ static int execute_op(struct htp_ops_context * octx) {
 
         case HTP_OP_MUL_MAT_NX:
             return op_matmul_nx(octx);
+
+        case HTP_OP_MUL_MAT_NX_SWIGLU:
+            return op_matmul_nx_swiglu(octx);
 
         case HTP_OP_MUL:
         case HTP_OP_ADD:
@@ -1345,7 +1519,9 @@ static void htp_main_thread(void * context) {
         uint32_t num_buffers = 0;
         uint32_t message_length = 0;
 
-        int err = dspqueue_peek(ctx->dsp_queue, &flags, &num_buffers, &message_length, 50000);
+        // relaxed (idle power release): fewer DSP wakeups; a new batch still returns the peek at once
+        const uint32_t timeout = atomic_load(&ctx->pwr_idle) ? HTP_PWR_PEEK_USEC : 50000;
+        int err = dspqueue_peek(ctx->dsp_queue, &flags, &num_buffers, &message_length, timeout);
         if (err == 0) {
             process_ops(ctx);
         } else if (err == AEE_EWOULDBLOCK || err == AEE_EEXPIRED) {

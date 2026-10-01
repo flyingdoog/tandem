@@ -29,6 +29,8 @@ struct htp_gdn_context {
     uint8_t * vtcm_base;
     uint32_t row_start;
     uint32_t nrows;
+    uint32_t   t_begin;  // first token for the recurrent pp path (0 = all)
+    dma_addr_t state_in; // initial state base instead of src[5] (0 = src[5], one sequence only)
 };
 
 static inline HVX_Vector gdn_mul_dot_f32(float * restrict dst, const HVX_Vector * restrict mul, const HVX_Vector * restrict dot, uint32_t n) {
@@ -800,7 +802,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
     for (int step = 0; step < 2 && ir_prefetch < row_end; step++) {
         const uint32_t piv1 = fastmodulo(ir_prefetch, H, fd_H);
         const uint32_t piv3 = fastdiv(ir_prefetch, fd_H);
-        dma_addr_t ps_in  = state->data + ((uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v) * sizeof(float);
+        dma_addr_t ps_in  = (gctx->state_in ? gctx->state_in : state->data) + ((uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v) * sizeof(float);
         dma_addr_t ps_out = state_out_dma_base + ((uint64_t) piv3 * H + piv1) * S_v * S_v * sizeof(float);
 
         // Push dummy write-back
@@ -835,10 +837,10 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
         const uint32_t ik3 = fastdiv(iv3, fd_rk3);
 
         dma_addr_t s_out  = state_out_dma_base + ((uint64_t) iv3 * H + iv1) * S_v * S_v * sizeof(float);
-        float * attn_data = dst_base + ((uint64_t) iv3 * n_tokens * H + iv1) * S_v;
+        float * attn_data = dst_base + ((uint64_t) iv3 * n_tokens * H + iv1) * S_v + (uint64_t) gctx->t_begin * S_v * H;
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
-        for (uint32_t t = 0; t < n_tokens; ++t) {
+        for (uint32_t t = gctx->t_begin; t < n_tokens; ++t) {
             const float * q_t = (const float *) ((const uint8_t *) (uintptr_t) q->data +
                     (uint64_t) iq3 * q->nb[3] + (uint64_t) t * q->nb[2] + (uint64_t) iq1 * q->nb[1]);
             const float * k_t = (const float *) ((const uint8_t *) (uintptr_t) k->data +
@@ -877,7 +879,7 @@ static void gated_delta_net_f32_pp_thread(unsigned int nth, unsigned int ith, vo
         if (ir_prefetch < row_end) {
             const uint32_t piv1 = fastmodulo(ir_prefetch, H, fd_H);
             const uint32_t piv3 = fastdiv(ir_prefetch, fd_H);
-            dma_addr_t ps_in = state->data + ((uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v) * sizeof(float);
+            dma_addr_t ps_in = (gctx->state_in ? gctx->state_in : state->data) + ((uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v) * sizeof(float);
 
             dma_queue_push(dma_q, dma_make_data(s_work[spad_idx], ps_in),
                            S_v * sizeof(float), S_v * sizeof(float),
@@ -2269,6 +2271,97 @@ static int gated_delta_net_f32_hmx_chunked(
     return HTP_STATUS_OK;
 }
 
+// K > 1 snapshots for one sequence: HMX chunked over the prefix, HVX recurrence over the last K - 1 tokens
+static int gated_delta_net_f32_hybrid(struct htp_ops_context * octx, const struct htp_gdn_kernel_params * kparams) {
+    const struct htp_tensor * v     = octx->src[2];
+    const struct htp_tensor * g     = octx->src[3];
+    const struct htp_tensor * dst   = octx->dst;
+
+    const uint32_t S_v      = kparams->S_v;
+    const uint32_t H        = kparams->H;
+    const uint32_t n_tokens = kparams->n_tokens;
+    const uint32_t K        = kparams->K;
+    const uint32_t n1       = n_tokens - K + 1;
+
+    if (!octx->ctx->hmx_enabled || kparams->n_seqs != 1 || K < 2 || n_tokens <= K || (S_v % 64) != 0 || g->ne[0] != 1 ||
+        n1 < HTP_GDN_MIN_TOKENS || octx->ctx->mdev.count > 1 || octx->op_params[1] != 0 || v->ne[3] != 1) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    const uint32_t total_rows = H;
+    uint32_t n_threads = (total_rows < octx->n_threads) ? total_rows : octx->n_threads;
+
+    struct htp_gdn_hmx_vtcm_layout hmx_layout;
+    uint32_t n_heads_batch = 1;
+    if (!htp_gdn_hmx_solve_layout(&hmx_layout, S_v, HTP_GDN_CHUNK_SIZE, total_rows, octx->ctx->vtcm_size, n_threads, true, &n_heads_batch)) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    // snapshot slot base (slot j = state after token n - 1 - j)
+    const struct htp_tensor * dst_cache = octx->dsts[1];
+    const dma_addr_t slot0 = dst_cache ? dst_cache->data : (dst->data + (uint64_t) S_v * H * n_tokens * sizeof(float));
+    const dma_addr_t slotK = slot0 + (uint64_t) (K - 1) * kparams->state_size_per_snap * sizeof(float);
+
+    // phase A: tokens [0, n1) with K = 1, final state -> slot K - 1
+    struct htp_tensor ta[5];
+    for (int i = 0; i < 5; i++) {
+        ta[i] = *octx->src[i];
+        ta[i].ne[2] = n1;
+    }
+    struct htp_tensor cache_a = dst_cache ? *dst_cache : *dst;
+    cache_a.data = slotK;
+
+    struct htp_ops_context octx_a = *octx;
+    for (int i = 0; i < 5; i++) {
+        octx_a.src[i] = &ta[i];
+    }
+    octx_a.dsts[1] = &cache_a;
+
+    struct htp_gdn_kernel_params kp_a = *kparams;
+    kp_a.n_tokens        = n1;
+    kp_a.K               = 1;
+    kp_a.n_threads       = n_threads;
+    kp_a.total_rows      = total_rows;
+    kp_a.rows_per_thread = (total_rows + n_threads - 1) / n_threads;
+    kp_a.kernel_type     = HTP_GDN_KERNEL_HMX_CHUNKED;
+    kp_a.pipeline        = hmx_layout.pipeline ? 1 : 0;
+    kp_a.chunk_size      = HTP_GDN_CHUNK_SIZE;
+    kp_a.n_chunks        = (n1 + HTP_GDN_CHUNK_SIZE - 1) / HTP_GDN_CHUNK_SIZE;
+    kp_a.n_heads_batch   = (uint16_t) n_heads_batch;
+    kp_a.vtcm_size       = (uint32_t) hmx_layout.total_bytes;
+    kp_a.state_aligned   = (uint32_t) hmx_layout.state_f32_bytes;
+    kp_a.vtcm_per_thread = (uint32_t) (hmx_layout.total_bytes / (n_threads > 0 ? n_threads : 1));
+    kp_a.div_n_threads   = init_fastdiv_values(n_threads);
+
+    int status = gated_delta_net_f32_hmx_chunked(&octx_a, &kp_a, 0, total_rows);
+    if (status != HTP_STATUS_OK) {
+        return status;
+    }
+
+    // phase B: tokens [n1, n_tokens) from slot K - 1, per-token snapshots
+    struct htp_gdn_kernel_params kp_b = *kparams;
+    kp_b.n_threads     = n_threads;
+    kp_b.kernel_type   = HTP_GDN_KERNEL_HVX_RECURRENT;
+    kp_b.div_n_threads = init_fastdiv_values(n_threads);
+
+    struct htp_gdn_context gctx;
+    memset(&gctx, 0, sizeof(gctx));
+    gctx.octx      = octx;
+    gctx.kparams   = &kp_b;
+    gctx.row_start = 0;
+    gctx.nrows     = total_rows;
+    gctx.vtcm_base = octx->ctx->vtcm_base;
+    gctx.t_begin   = n1;
+    gctx.state_in  = slotK;
+    htp_gdn_vtcm_layout_build(&gctx.layout, S_v, n_threads);
+    if (gctx.layout.total_bytes > octx->ctx->vtcm_size) {
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
+
+    work_queue_run(octx->ctx->work_queue, gated_delta_net_f32_pp_thread, &gctx, n_threads);
+    return HTP_STATUS_OK;
+}
+
 int op_gated_delta_net(struct htp_ops_context * octx) {
     const struct htp_tensor * q     = octx->src[0];
     const struct htp_tensor * k     = octx->src[1];
@@ -2416,6 +2509,13 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
         return gated_delta_net_f32_hmx_chunked(octx, kparams, row_start, nrows);
     }
 
+    if (kparams->K > 1 && n_tokens > kparams->K && !(octx->ctx->tandem_off & 2)) {
+        const int st = gated_delta_net_f32_hybrid(octx, kparams);
+        if (st != HTP_STATUS_NO_SUPPORT) {
+            return st;
+        }
+    }
+
     const uint32_t n_threads = (nrows < kparams->n_threads) ? nrows : kparams->n_threads;
 
     struct htp_gdn_context gctx;
@@ -2424,6 +2524,8 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
     gctx.row_start = row_start;
     gctx.nrows     = nrows;
     gctx.vtcm_base = octx->ctx->vtcm_base;
+    gctx.t_begin   = 0;
+    gctx.state_in  = 0;
 
     htp_gdn_vtcm_layout_build(&gctx.layout, S_v, n_threads);
 

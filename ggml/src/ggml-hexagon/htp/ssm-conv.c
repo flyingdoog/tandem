@@ -400,6 +400,138 @@ static void ssm_conv_thread_f32_prefill(unsigned int nth, unsigned int ith, void
          dst->ne[2], dst->ne[3]);
 }
 
+static inline void ssm_conv_push(dma_queue * q, dma_data d, size_t dst_stride, size_t src_stride, size_t row, size_t n) {
+    if (!dma_queue_push(q, d, dst_stride, src_stride, row, n)) {
+        dma_queue_flush(q);
+        dma_queue_push(q, d, dst_stride, src_stride, row, n);
+    }
+}
+
+// Prefill with a channel-fastest conv input ("chanfast", see ggml-hexagon.cpp): X row r = src0->data + i3*nb[2] +
+// r*nb[0] (d_inner floats), rows 0..d_conv-2 = previous conv state, row d_conv-1+t = token t; dst[:, t] =
+// sum_j w_j * X[t+j] (+ silu). No transposes: each thread takes a channel slice, unpacks its weights once and streams
+// X rows through two (d_conv-1 + t_chunk)-row VTCM windows (2D DMA in, double buffered; the last d_conv-1 rows of a
+// window are carried to the front of the next), out rows go back by 2D DMA from two output buffers. Same qf32
+// accumulation order as the transposing prefill kernel, and silu = the SILU op's sigmoid * x, so results match bitwise.
+static void ssm_conv_thread_f32_chanfast(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_ssm_conv_context *             scctx   = (struct htp_ssm_conv_context *) data;
+    struct htp_ops_context *                  octx    = scctx->octx;
+    const struct htp_ssm_conv_kernel_params * kparams = scctx->kparams;
+
+    const struct htp_tensor * restrict src0 = octx->src[0];
+    const struct htp_tensor * restrict src1 = octx->src[1];
+    const struct htp_tensor * restrict dst  = octx->dst;
+
+    dma_queue * dma_q = octx->ctx->dma[ith];
+
+    const uint32_t d_conv  = kparams->d_conv;
+    const uint32_t n_t     = kparams->n_t;
+    const uint32_t n_s     = kparams->n_s;
+    const uint32_t t_chunk = kparams->t_chunk;
+    const uint32_t halo    = d_conv - 1;
+
+    const uint32_t dr  = scctx->nrows_per_thread;
+    const uint32_t ir0 = scctx->row_start + dr * ith;
+    const uint32_t ir1 = MIN(ir0 + dr, scctx->row_start + scctx->nrows);
+
+    if (ir0 >= ir1) {
+        return;
+    }
+
+    const uint32_t cw        = ir1 - ir0;                    // channels of this thread
+    const uint32_t cws       = hex_round_up(cw, VLEN_FP32);  // VTCM row stride in floats
+    const size_t   row_bytes = (size_t) cw * sizeof(float);
+    const size_t   vrow      = (size_t) cws * sizeof(float);
+
+    uint8_t * src1_spad_base = octx->src1_spad.data + ith * octx->src1_spad.size_per_thread;
+    uint8_t * src0_spad_base = octx->src0_spad.data + ith * octx->src0_spad.size_per_thread;
+    uint8_t * dst_spad_base  = octx->dst_spad.data  + ith * octx->dst_spad.size_per_thread;
+
+    const size_t weight_bytes    = (size_t) cw * d_conv * sizeof(float);
+    const size_t weight_raw_size = hex_round_up(weight_bytes, 128);
+
+    float * w_raw = (float *) src1_spad_base;
+    float * w_T   = (float *) (src1_spad_base + weight_raw_size);
+
+    const size_t win_floats = (size_t) (halo + t_chunk) * cws;
+    float * win[2] = { (float *) src0_spad_base, (float *) src0_spad_base + win_floats };
+    float * out[2] = { (float *) dst_spad_base,  (float *) dst_spad_base + (size_t) t_chunk * cws };
+    float * sig    = (float *) dst_spad_base + (size_t) 2 * t_chunk * cws;
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+
+    // weights [d_conv, d_inner] (tap fastest): the thread's slice is contiguous -> tap-major rows
+    ssm_conv_push(dma_q, dma_make_data((uint8_t *) w_raw, src1->data + ir0 * d_conv * sizeof(float)),
+                  weight_bytes, weight_bytes, weight_bytes, 1);
+    dma_queue_pop(dma_q);
+    hvx_ssm_conv_unpack_to_T(w_raw, w_T, cw, cws, d_conv);
+
+    for (uint32_t i3 = 0; i3 < n_s; ++i3) {
+        const dma_addr_t x_base   = src0->data + i3 * src0->nb[2] + ir0 * sizeof(float);
+        const dma_addr_t out_base = dst->data  + i3 * dst->nb[2]  + ir0 * sizeof(float);
+        const uint32_t   n_chunks = (n_t + t_chunk - 1) / t_chunk;
+
+        // window 0: X rows [0, halo + tc0)
+        ssm_conv_push(dma_q, dma_make_data((uint8_t *) win[0], x_base), vrow, src0->nb[0], row_bytes, halo + MIN(t_chunk, n_t));
+        dma_queue_pop(dma_q);
+
+        for (uint32_t k = 0; k < n_chunks; ++k) {
+            const uint32_t t0 = k * t_chunk;
+            const uint32_t tc = MIN(t_chunk, n_t - t0);
+            float * w_cur = win[k & 1];
+            float * w_nxt = win[(k + 1) & 1];
+            float * o     = out[k & 1];
+
+            // prefetch the next window's new rows X[t0 + tc + halo, ...) behind the carried halo
+            if (k + 1 < n_chunks) {
+                const uint32_t tn = MIN(t_chunk, n_t - (t0 + tc));
+                ssm_conv_push(dma_q, dma_make_data((uint8_t *) (w_nxt + (size_t) halo * cws), x_base + (size_t) (t0 + tc + halo) * src0->nb[0]),
+                              vrow, src0->nb[0], row_bytes, tn);
+            }
+
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) t0);
+            for (uint32_t t = 0; t < tc; ++t) {
+                float * orow = o + (size_t) t * cws;
+                for (uint32_t cb = 0; cb < cw; cb += VLEN_FP32) {
+                    HVX_Vector acc = hvx_vec_splat_f32(0.0f);
+                    for (uint32_t j = 0; j < d_conv; ++j) {
+                        HVX_Vector x = *(const HVX_Vector *) (w_cur + (size_t) (t + j) * cws + cb);
+                        HVX_Vector w = *(const HVX_Vector *) (w_T + (size_t) j * cws + cb);
+                        acc          = Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vmpy_VsfVsf(x, w));
+                    }
+                    *(HVX_Vector *) (orow + cb) = Q6_Vsf_equals_Vqf32(acc);
+                }
+                if (kparams->silu) {
+                    hvx_sigmoid_f32_aa((uint8_t *) sig, (const uint8_t *) orow, cws);
+                    hvx_mul_f32_aaa((uint8_t *) orow, (const uint8_t *) orow, (const uint8_t *) sig, cws);
+                }
+            }
+            // carry X rows [t0 + tc, t0 + tc + halo) to the front of the next window
+            if (k + 1 < n_chunks) {
+                for (uint32_t r = 0; r < halo; ++r) {
+                    const HVX_Vector * s = (const HVX_Vector *) (w_cur + (size_t) (tc + r) * cws);
+                    HVX_Vector *       d = (HVX_Vector *) (w_nxt + (size_t) r * cws);
+                    for (uint32_t v = 0; v < cws / VLEN_FP32; ++v) {
+                        d[v] = s[v];
+                    }
+                }
+            }
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) t0);
+
+            ssm_conv_push(dma_q, dma_make_data(out_base + (size_t) t0 * dst->nb[1], (uint8_t *) o), dst->nb[1], vrow, row_bytes, tc);
+
+            // in flight now: [out(k-1)], [in(k+1)], out(k). Retire out(k-1) (frees o for chunk k+1) and in(k+1).
+            if (k > 0) {
+                dma_queue_pop(dma_q);
+            }
+            if (k + 1 < n_chunks) {
+                dma_queue_pop(dma_q);
+            }
+        }
+        dma_queue_pop(dma_q);  // out(last)
+    }
+}
+
 int op_ssm_conv_f32(struct htp_ops_context * octx) {
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * src1 = octx->src[1];
@@ -473,9 +605,11 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
          src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
          src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
          dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-         kparams->n_t == 1 ? "decode" : "prefill");
+         kparams->chanfast ? "chanfast" : kparams->n_t == 1 ? "decode" : "prefill");
 
-    if (kparams->n_t == 1) {
+    if (kparams->chanfast) {
+        work_queue_run(octx->ctx->work_queue, ssm_conv_thread_f32_chanfast, &scctx, n_threads);
+    } else if (kparams->n_t == 1) {
         work_queue_run(octx->ctx->work_queue, ssm_conv_thread_f32_decode, &scctx, n_threads);
     } else {
         work_queue_run(octx->ctx->work_queue, ssm_conv_thread_f32_prefill, &scctx, n_threads);

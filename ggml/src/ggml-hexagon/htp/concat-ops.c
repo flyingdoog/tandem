@@ -302,6 +302,164 @@ static bool concat_dim1_contiguous_dma(struct htp_ops_context * octx, int dim, u
     return true;
 }
 
+// dim 0 concat with short output rows (W = ne00 + ne10 divides 32) and src1 contiguous along rows
+// (e.g. the Gated DeltaNet conv state [3, C] + transposed token [1, C]): one DMA per input, vgather, one DMA out
+static void concat_dim0_gather_f32(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_concat_context * cctx = (struct htp_concat_context *) data;
+    struct htp_ops_context * octx = cctx->octx;
+
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * src1 = octx->src[1];
+    const struct htp_tensor * dst  = octx->dst;
+
+    const uint32_t ne00  = src0->ne[0];
+    const uint32_t ne10  = src1->ne[0];
+    const uint32_t W     = ne00 + ne10;
+    const uint32_t nrows = dst->ne[1];
+    const uint32_t r0    = ith * cctx->nrows_per_thread;
+    if (r0 >= nrows) {
+        return;
+    }
+    const uint32_t nr = MIN(cctx->nrows_per_thread, nrows - r0);
+
+    dma_queue * dma_q = octx->ctx->dma[ith];
+    uint8_t * spad = octx->src0_spad.data + ith * octx->src0_spad.size_per_thread;
+
+    const uint32_t a_bytes = hex_round_up(cctx->nrows_per_thread * ne00 * sizeof(float), VLEN);
+    const uint32_t b_bytes = hex_round_up(cctx->nrows_per_thread * ne10 * sizeof(float), VLEN);
+    uint8_t * va = spad;
+    uint8_t * vb = spad + a_bytes;
+    HVX_Vector * vo = (HVX_Vector *) (vb + b_bytes);
+
+    // word offsets (from va) for output vector 0, and the increment per output vector
+    const uint32_t rpv = 32 / W;
+    int32_t off0[32] __attribute__((aligned(128)));
+    int32_t step[32] __attribute__((aligned(128)));
+    for (uint32_t l = 0; l < 32; l++) {
+        const uint32_t r = l / W, e = l % W;
+        if (e < ne00) {
+            off0[l] = (r * ne00 + e) * sizeof(float);
+            step[l] = rpv * ne00 * sizeof(float);
+        } else {
+            off0[l] = a_bytes + ((e - ne00) * nr + r) * sizeof(float);
+            step[l] = rpv * sizeof(float);
+        }
+    }
+    const HVX_Vector v_step = *(const HVX_Vector *) step;
+    const uint32_t mu = a_bytes + b_bytes - 1;
+    const uint32_t n_vec = (nr * W + 31) / 32;
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+
+    for (uint32_t p = 0; p < cctx->nplanes; p++) {
+        const uint32_t i3 = p / dst->ne[2];
+        const uint32_t i2 = p - i3 * dst->ne[2];
+        const dma_addr_t src0_plane = src0->data + i2 * src0->nb[2] + i3 * src0->nb[3];
+        const dma_addr_t src1_plane = src1->data + i2 * src1->nb[2] + i3 * src1->nb[3];
+        const dma_addr_t dst_plane  = dst->data  + i2 * dst->nb[2]  + i3 * dst->nb[3];
+
+        dma_queue_push_single_1d(dma_q, dma_make_data(va, src0_plane + r0 * src0->nb[1]), nr * ne00 * sizeof(float));
+        for (uint32_t j = 0; j < ne10; j++) {
+            dma_queue_push_single_1d(dma_q, dma_make_data(vb + j * nr * sizeof(float), src1_plane + j * src1->nb[0] + r0 * src1->nb[1]),
+                                     nr * sizeof(float));
+        }
+        for (uint32_t j = 0; j < 1 + ne10; j++) {
+            dma_queue_pop(dma_q);
+        }
+
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) p);
+        HVX_Vector v_off = *(const HVX_Vector *) off0;
+        for (uint32_t k = 0; k < n_vec; k++) {
+            Q6_vgather_ARMVw(&vo[k], (size_t) va, mu, v_off);
+            v_off = Q6_Vw_vadd_VwVw(v_off, v_step);
+        }
+        // a vgather writes its destination asynchronously: a vector load of the destination waits for it, the DMA
+        // below does not, so it could read vectors whose gathers are still in flight
+        for (uint32_t k = 0; k < n_vec; k++) {
+            (void) *(volatile HVX_Vector *) &vo[k];
+        }
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) p);
+
+        dma_queue_push_single_1d(dma_q, dma_make_data(dst_plane + r0 * dst->nb[1], vo), nr * W * sizeof(float));
+        dma_queue_pop(dma_q);
+    }
+}
+
+static inline void concat_push(dma_queue * q, dma_data d, size_t dst_stride, size_t src_stride, size_t row, size_t n) {
+    if (!dma_queue_push(q, d, dst_stride, src_stride, row, n)) {
+        dma_queue_flush(q);
+        dma_queue_push(q, d, dst_stride, src_stride, row, n);
+    }
+}
+
+// "chanfast" Gated DeltaNet conv input (the host rewrites the conv_input tensor as channel-fastest, see
+// ggml-hexagon.cpp): dst row t = ne1 floats (nb[1] == 4, nb[0] == ne1*4). Rows [0, ne00) = src0 (the conv state
+// [ne00, C], time fastest) transposed in VTCM; rows [ne00, ne0) = src1 (the tokens: a transposed view of a
+// channel-fastest tensor, nb[1] == 4) copied DDR -> DDR by one 2D DMA per thread and plane. No per-element transpose.
+static void concat_chanfast_f32(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_concat_context * cctx = (struct htp_concat_context *) data;
+    struct htp_ops_context *    octx = cctx->octx;
+
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * src1 = octx->src[1];
+    const struct htp_tensor * dst  = octx->dst;
+
+    const uint32_t C  = dst->ne[1];
+    const uint32_t c0 = ith * cctx->nrows_per_thread;
+    const uint32_t c1 = MIN(c0 + cctx->nrows_per_thread, C);
+    if (c0 >= c1) {
+        return;
+    }
+    const uint32_t cw  = c1 - c0;
+    const uint32_t cws = hex_round_up(cw, 32);
+    const uint32_t ns0 = src0->ne[0];
+    const uint32_t nt  = src1->ne[0];
+
+    dma_queue * q   = octx->ctx->dma[ith];
+    float *     raw = (float *) (octx->src0_spad.data + ith * octx->src0_spad.size_per_thread);
+    float *     T   = raw + hex_round_up(cw * ns0, 32);
+
+    for (uint32_t i3 = 0; i3 < dst->ne[3]; ++i3) {
+        for (uint32_t i2 = 0; i2 < dst->ne[2]; ++i2) {
+            const dma_addr_t d_plane  = dst->data  + i3 * dst->nb[3]  + i2 * dst->nb[2]  + c0 * sizeof(float);
+            const dma_addr_t s0_slice = src0->data + i3 * src0->nb[3] + i2 * src0->nb[2] + c0 * src0->nb[1];
+            const dma_addr_t s1_slice = src1->data + i3 * src1->nb[3] + i2 * src1->nb[2] + c0 * sizeof(float);
+            const size_t     st_bytes = (size_t) cw * ns0 * sizeof(float);
+
+            // queue: [state in, tokens] -> pop state in, transpose, [tokens, state out] -> pop both
+            concat_push(q, dma_make_data((uint8_t *) raw, s0_slice), st_bytes, st_bytes, st_bytes, 1);
+            concat_push(q, dma_make_data(d_plane + (size_t) ns0 * dst->nb[0], s1_slice), dst->nb[0], src1->nb[0],
+                        (size_t) cw * sizeof(float), nt);
+            dma_queue_pop(q);
+
+            for (uint32_t c = 0; c < cw; ++c) {
+                for (uint32_t j = 0; j < ns0; ++j) {
+                    T[(size_t) j * cws + c] = raw[(size_t) c * ns0 + j];
+                }
+            }
+
+            concat_push(q, dma_make_data(d_plane, (uint8_t *) T), dst->nb[0], (size_t) cws * sizeof(float),
+                        (size_t) cw * sizeof(float), ns0);
+            dma_queue_pop(q);
+            dma_queue_pop(q);
+        }
+    }
+}
+
+static bool concat_is_chanfast(struct htp_ops_context * octx, int dim) {
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * src1 = octx->src[1];
+    const struct htp_tensor * dst  = octx->dst;
+
+    return dim == 0 && octx->ctx->mdev.count <= 1 &&
+           dst->type == HTP_TYPE_F32 && src0->type == HTP_TYPE_F32 && src1->type == HTP_TYPE_F32 &&
+           dst->nb[1] == 4 && dst->nb[0] == (size_t) dst->ne[1] * 4 &&
+           src0->nb[0] == 4 && src0->nb[1] == (size_t) src0->ne[0] * 4 &&
+           src1->nb[1] == 4 && src1->nb[0] >= (size_t) src1->ne[1] * 4 &&
+           src0->ne[1] == dst->ne[1] && src1->ne[1] == dst->ne[1] && dst->ne[0] == src0->ne[0] + src1->ne[0] &&
+           !htp_tensor_is_extended(src0) && !htp_tensor_is_extended(src1) && !htp_tensor_is_extended(dst);
+}
+
 int op_concat(struct htp_ops_context * octx) {
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * src1 = octx->src[1];
@@ -312,6 +470,25 @@ int op_concat(struct htp_ops_context * octx) {
     const uint32_t type_size = (dst->type == HTP_TYPE_F32 || dst->type == HTP_TYPE_I32) ? 4 : 2;
     bool is_src1_transposed  = (src1->nb[0] > src1->nb[1]);
     bool is_src0_transposed  = (src0->nb[0] > src0->nb[1]);
+
+    if (concat_is_chanfast(octx, dim)) {
+        struct htp_concat_context cctx;
+        const uint32_t n_threads = octx->n_threads;
+        cctx.octx             = octx;
+        cctx.dim              = dim;
+        cctx.nrows_per_thread = hex_round_up((dst->ne[1] + n_threads - 1) / n_threads, 32);
+        const uint32_t cws    = cctx.nrows_per_thread;
+        octx->src0_spad.size_per_thread = hex_round_up(cws * src0->ne[0] * sizeof(float), VLEN) +
+                                          hex_round_up(cws * src0->ne[0] * sizeof(float), VLEN) + VLEN;
+        octx->src0_spad.size = n_threads * octx->src0_spad.size_per_thread;
+        if (octx->src0_spad.size > octx->ctx->vtcm_size) {
+            return HTP_STATUS_VTCM_TOO_SMALL;
+        }
+        octx->src0_spad.data = octx->ctx->vtcm_base;
+        octx->src0_spad.src  = NULL;
+        work_queue_run(octx->ctx->work_queue, concat_chanfast_f32, &cctx, n_threads);
+        return HTP_STATUS_OK;
+    }
 
     if (concat_dim1_contiguous_dma(octx, dim, type_size)) {
         return HTP_STATUS_OK;
@@ -328,6 +505,27 @@ int op_concat(struct htp_ops_context * octx) {
     void (*worker_func)(unsigned int, unsigned int, void *) = concat_generic;
 
     const bool rows_ok = src0->nb[0] == type_size && src1->nb[1] == type_size && dst->nb[0] == type_size;
+
+    const uint32_t cat_w = src0->ne[0] + src1->ne[0];
+    if (!(octx->ctx->tandem_off & 4) && dim == 0 && type_size == 4 && src0->type == dst->type && src1->type == dst->type &&
+        cat_w <= 32 && (32 % cat_w) == 0 && octx->ctx->mdev.count <= 1 &&
+        src0->nb[0] == 4 && src0->nb[1] == src0->ne[0] * 4 && src1->nb[1] == 4 &&
+        dst->nb[0] == 4 && dst->nb[1] == cat_w * 4 &&
+        src0->ne[1] == dst->ne[1] && src1->ne[1] == dst->ne[1] &&
+        !htp_tensor_is_extended(src0) && !htp_tensor_is_extended(src1) && !htp_tensor_is_extended(dst)) {
+        cctx.nplanes          = dst->ne[2] * dst->ne[3];
+        cctx.nrows_per_thread = hex_round_up((dst->ne[1] + n_threads - 1) / n_threads, 32);
+        const size_t per = cctx.nrows_per_thread * sizeof(float);
+        octx->src0_spad.size_per_thread = hex_round_up(per * src0->ne[0], VLEN) + hex_round_up(per * src1->ne[0], VLEN) +
+                                          hex_round_up(per * cat_w, VLEN) + VLEN;
+        octx->src0_spad.size = n_threads * octx->src0_spad.size_per_thread;
+        if (octx->src0_spad.size <= octx->ctx->vtcm_size) {
+            octx->src0_spad.data = octx->ctx->vtcm_base;
+            octx->src0_spad.src  = NULL;
+            work_queue_run(octx->ctx->work_queue, concat_dim0_gather_f32, &cctx, n_threads);
+            return HTP_STATUS_OK;
+        }
+    }
 
     if (dim == 0 && is_src1_transposed && !is_src0_transposed && rows_ok) {
         const uint32_t total_rows = dst->ne[1];
