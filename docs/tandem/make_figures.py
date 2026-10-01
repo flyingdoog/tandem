@@ -2,7 +2,7 @@
 """Figures of the Tandem README (matplotlib, white background).
 
 Numbers: the evaluation on a OnePlus 13T (Snapdragon 8 Elite) and a OnePlus 15 (Snapdragon 8 Elite Gen 5).
-usage: python docs/tandem/make_figures.py      writes docs/tandem/step-time.svg and docs/tandem/time-saved.svg
+usage: python docs/tandem/make_figures.py      writes docs/tandem/step-time.svg and docs/tandem/text-steps.svg
 """
 import os
 
@@ -29,11 +29,14 @@ ENGINES = [("Tandem (NPU)", (1.492, "1.49"), (4.87, "4.87")),
            ("llama.cpp (GPU)", (5.075, "5.08"), (22.82, "22.8")),
            ("llama.cpp (CPU)", (11.19, "11.2"), (69.77, "69.8"))]
 
-# server time per text step (s): Tandem, llama.cpp's NPU backend (its fastest configuration)
-REDUCTIONS = [("Qwen3.5-2B", 0.767, 0.972), ("Qwen3.5-4B", 1.3515, 1.810), ("Qwen3.5-9B", 2.145, 3.0355),
-              ("Agent policy, Snapdragon 8 Elite", 1.492, 1.971),
-              ("Agent policy, Snapdragon 8 Elite Gen 5", 1.279, 1.6845),
-              ("AndroidControl benchmark", 1.212, 1.580)]
+# server time per text step (s): llama.cpp's NPU backend in its fastest configuration, Tandem
+# (as measured for bars and percentages, as printed in the paper)
+TEXT_STEPS = [("Qwen3.5-2B", (0.972, "0.97"), (0.767, "0.77")), ("Qwen3.5-4B", (1.810, "1.81"), (1.3515, "1.35")),
+              ("Qwen3.5-9B", (3.0355, "3.04"), (2.145, "2.15")),
+              ("Agent policy\n(8 Elite)", (1.971, "1.97"), (1.492, "1.49")),
+              ("Agent policy\n(8 Elite Gen 5)", (1.6845, "1.69"), (1.279, "1.28")),
+              ("AndroidControl", (1.580, "1.58"), (1.212, "1.21"))]
+GRAY = "#9AA0A6"
 
 
 def ratio(r):
@@ -69,31 +72,33 @@ def step_time(path):
     plt.close(fig)
 
 
-def time_saved(path):
-    fig, ax = plt.subplots(figsize=(8.0, 2.6))
-    ys = [0, 1, 2, 3.4, 4.4, 5.4]  # a gap between the model sizes and the devices / workloads
-    for y, (name, t, u) in zip(ys, REDUCTIONS):
-        v = 100 * (1 - t / u)
-        ax.barh(y, v, height=0.6, color=BLUE)
-        ax.text(v + 0.4, y, f"{v:.0f}%", va="center", fontsize=8.5, color="#222222")
-    ax.set_xlim(0, 35)
-    ax.set_xticks([0, 10, 20, 30])
-    ax.set_xticklabels(["0%", "10%", "20%", "30%"])
-    ax.set_yticks(ys)
-    ax.set_yticklabels([s[0] for s in REDUCTIONS])
-    ax.invert_yaxis()
-    ax.grid(axis="x", color="#dddddd", linewidth=0.6)
+def text_steps(path):
+    fig, ax = plt.subplots(figsize=(8.0, 3.3))
+    xs = [0, 1.2, 2.4, 4.0, 5.2, 6.4]  # a gap between the stock models and the agent workloads
+    w = 0.36
+    for i, (x, (name, (base, base_s), (ours, ours_s))) in enumerate(zip(xs, TEXT_STEPS)):
+        ax.bar(x - w / 2, base, width=w, color=GRAY, label="llama.cpp (NPU)" if i == 0 else None)
+        ax.bar(x + w / 2, ours, width=w, color=BLUE, label="Tandem (NPU)" if i == 0 else None)
+        ax.text(x - w / 2, base + 0.04, base_s, ha="center", va="bottom", fontsize=8, color="#444444")
+        ax.text(x + w / 2, ours + 0.04, ours_s, ha="center", va="bottom", fontsize=8, color="#222222")
+        ax.text(x, base + 0.3, f"−{100 * (1 - ours / base):.0f}%", ha="center", va="bottom", fontsize=9.5,
+                color=BLUE, fontweight="bold")
+    ax.set_xticks(xs)
+    ax.set_xticklabels([t[0] for t in TEXT_STEPS], fontsize=9)
+    ax.set_ylim(0, 3.75)
+    ax.set_ylabel("server time per text step (s)", fontsize=9)
+    ax.grid(axis="y", color="#dddddd", linewidth=0.6)
     ax.set_axisbelow(True)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
-    ax.set_xlabel("less time per text step than llama.cpp on the NPU (its fastest configuration)", fontsize=9)
+    ax.legend(loc="upper left", frameon=False, fontsize=9)
     fig.tight_layout()
     fig.savefig(path, metadata={"Date": None})
     plt.close(fig)
 
 
 if __name__ == "__main__":
-    for name, fn in (("step-time", step_time), ("time-saved", time_saved)):
+    for name, fn in (("step-time", step_time), ("text-steps", text_steps)):
         path = os.path.join(OUT, f"{name}.svg")
         fn(path)
         print("wrote", path)

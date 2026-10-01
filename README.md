@@ -47,12 +47,12 @@ screenshot step is from a separate run with speculation.
   checkpoint policy and speculation change only the floating-point rounding, which reworded at most one free-text
   summary per trace and changed no action.
 
-![Less time per text step than llama.cpp on the NPU: Qwen3.5-2B 21%, Qwen3.5-4B 25%, Qwen3.5-9B 29%, the agent policy on the Snapdragon 8 Elite 24% and on the Snapdragon 8 Elite Gen 5 24%, AndroidControl 23%](docs/tandem/time-saved.svg)
+![Server time per text step, llama.cpp on the NPU against Tandem: Qwen3.5-2B 0.97 and 0.77 s, Qwen3.5-4B 1.81 and 1.35 s, Qwen3.5-9B 3.04 and 2.15 s, the agent policy on the Snapdragon 8 Elite 1.97 and 1.49 s and on the Snapdragon 8 Elite Gen 5 1.69 and 1.28 s, AndroidControl 1.58 and 1.21 s](docs/tandem/text-steps.svg)
 
-The gains hold for the stock Qwen3.5 models (21–29% less time per text step, growing with the model), on the next NPU
-generation (OnePlus 15, Snapdragon 8 Elite Gen 5, Hexagon v81: 1.28 s against 1.69 s per text step, 24% less, and
-3.95 s against 4.67 s per screenshot step, 15% less), and on the public AndroidControl benchmark (its first 300 test
-steps: 23% less, with identical answers).
+The gains hold for the stock Qwen3.5 models, where they grow with the model (21–29% less time per text step), on the
+next NPU generation (OnePlus 15, Snapdragon 8 Elite Gen 5, Hexagon v81; with screenshots 3.95 s against 4.67 s per
+step, 15% less), and on the public AndroidControl benchmark (its first 300 test steps, with identical answers).
+llama.cpp runs in its fastest configuration, on the NPU without speculation.
 
 In these comparisons, Tandem runs with checkpoints at the divergence point but keeps llama.cpp's tail pass. Dropping it
 as well, as `--agent-checkpoints` does, shortens a text step by about another 0.09 s.
