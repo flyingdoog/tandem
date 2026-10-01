@@ -342,6 +342,10 @@ struct server_slot {
     std::vector<common_adapter_lora_info> lora;
     int32_t alora_invocation_start = -1;
 
+    // Tandem (LLAMA_CKPT_BEFORE_IMAGE, LLAMA_CKPT_DIVERGE): per-task positions (prompt token index) of the extra checkpoints, -1 = none
+    int32_t ckpt_img_start = -1; // first media token of the prompt, when it is not cached yet
+    int32_t ckpt_lcp_break = -1; // common prefix with the previous prompt, inside the text before the first media chunk (if any)
+
     // sampling
     json json_schema;
 
@@ -401,6 +405,9 @@ struct server_slot {
 
         // clear alora start
         alora_invocation_start = -1;
+
+        ckpt_img_start = -1;
+        ckpt_lcp_break = -1;
 
         // clear multimodal state
         mbatch.reset();
@@ -909,6 +916,11 @@ private:
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
+    int ckpt_tail = 1;    // env: LLAMA_CKPT_TAIL (Tandem, 0 = no n-4 tail pass, no identical re-snapshots)
+    int ckpt_before_image = 0; // env: LLAMA_CKPT_BEFORE_IMAGE (Tandem, bit 1 = checkpoint before the first media chunk,
+                               //      bit 2 = checkpoint at the common prefix with the previous prompt, in the text before it)
+    int ckpt_diverge = 0;      // env: LLAMA_CKPT_DIVERGE (Tandem, > 0 = checkpoint at the common prefix with the previous prompt
+                               //      also for text prompts, at least this many tokens past the restored position)
 
     int n_empty_consecutive = 0;
 
@@ -1337,6 +1349,54 @@ private:
 
             if (slots_n_diff) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
+            }
+        }
+
+        {
+            // Tandem: opt-in for stateless single-shot clients (see the checkpoint_offsets comment in update_slots()
+            // and the top of create_checkpoint()): on with --agent-checkpoints; LLAMA_CKPT_TAIL=0 turns it on and any
+            // other value off. Off keeps the upstream behaviour.
+            const char * LLAMA_CKPT_TAIL = getenv("LLAMA_CKPT_TAIL");
+            ckpt_tail = LLAMA_CKPT_TAIL ? (std::string(LLAMA_CKPT_TAIL) == "0" ? 0 : 1) : (params_base.agent_checkpoints ? 0 : 1);
+
+            if (!ckpt_tail) {
+                SRV_WRN("%s", "no n-4 tail checkpoint pass (--agent-checkpoints or LLAMA_CKPT_TAIL=0), identical checkpoints are reused instead of re-snapshotted\n");
+            }
+        }
+
+        {
+            // Tandem: opt-in extra context checkpoints for prompts with media (see the mtmd loop in update_slots()).
+            // unset, 0 or anything outside 1..3 keeps the upstream behaviour (no checkpoint before or inside an image step's
+            // text prefix unless a user message starts there).
+            //  1: checkpoint right before the first media chunk (the state after all text before it)
+            //  2: checkpoint at the common prefix with the previous prompt, when it lies in the text before the first media
+            //     chunk and at least 64 tokens past the restored position
+            //  3: both
+            const char * LLAMA_CKPT_BEFORE_IMAGE = getenv("LLAMA_CKPT_BEFORE_IMAGE");
+            const int v = LLAMA_CKPT_BEFORE_IMAGE ? atoi(LLAMA_CKPT_BEFORE_IMAGE) : 0;
+            ckpt_before_image = (v >= 1 && v <= 3) ? v : 0;
+
+            if (ckpt_before_image) {
+                SRV_WRN("LLAMA_CKPT_BEFORE_IMAGE = %d:%s%s\n", ckpt_before_image,
+                        (ckpt_before_image & 1) ? " checkpoint before the first media chunk;" : "",
+                        (ckpt_before_image & 2) ? " checkpoint at the common prefix with the previous prompt before it;" : "");
+            }
+        }
+
+        {
+            // Tandem: opt-in checkpoint at the divergence point (the end of the common prefix with the previous prompt)
+            // for text prompts and for the text before the first media chunk (see where ckpt_lcp_break is set in
+            // update_slots()). On with --agent-checkpoints; LLAMA_CKPT_DIVERGE overrides it, 0 keeps the upstream
+            // behaviour.
+            //  1: on, the checkpoint must be at least 32 tokens past the restored position
+            //  N > 1: on, at least N tokens past the restored position
+            const char * LLAMA_CKPT_DIVERGE = getenv("LLAMA_CKPT_DIVERGE");
+            const int v = LLAMA_CKPT_DIVERGE ? atoi(LLAMA_CKPT_DIVERGE) : (params_base.agent_checkpoints ? 1 : 0);
+            ckpt_diverge = v == 1 ? 32 : std::max(v, 0);
+
+            if (ckpt_diverge) {
+                SRV_WRN("divergence-point checkpoints (--agent-checkpoints or LLAMA_CKPT_DIVERGE=%d): checkpoint at the common prefix with the previous prompt, at least %d tokens past the restored position\n",
+                        v, ckpt_diverge);
             }
         }
 
@@ -2309,6 +2369,32 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // Tandem (LLAMA_CKPT_TAIL=0): skip identical re-snapshots.
+        // after a checkpoint at n_tokens = N is restored, the next batch starts at N, and when that batch is a user
+        // start or near the prompt end the code below would snapshot the same state again (~50 MiB of copies for a
+        // hybrid model) and supersede the old one. every checkpoint that survived the restore/erase step in
+        // update_slots() has pos_max <= pos_next, i.e. it lies inside the prefix that is shared with the current
+        // prompt, so a surviving checkpoint with the same n_tokens / pos_min / pos_max holds the state of the same
+        // token prefix. instead of copying it again we move it to the back of the FIFO and mark it as created by
+        // this task, which is what the supersede path below ends up with. differences from the default path:
+        // - no memcpy of the recurrent state + draft state (the data is the restored bytes, or the state of the same
+        //   prefix computed with a different batch partition)
+        // - the eviction loops below are not run for this call, so no other checkpoint is evicted to make room for
+        //   a checkpoint that then only replaces an existing one (the default path can evict one needlessly when full)
+        if (!ckpt_tail) {
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            auto & ckpts = slot.prompt.checkpoints;
+            for (auto it = ckpts.begin(); it != ckpts.end(); ++it) {
+                if (it->n_tokens == n_tokens_new && it->pos_min == pos_min && it->pos_max == pos_max) {
+                    it->id_task = id_task;
+                    ckpts.splice(ckpts.end(), ckpts, it);
+                    SLT_TRC(slot, "kept identical context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                            pos_min, pos_max, n_tokens_new, (float) ckpts.back().size() / 1024 / 1024);
+                    return;
+                }
+            }
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -3163,6 +3249,10 @@ private:
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
 
+                        // Tandem (LLAMA_CKPT_BEFORE_IMAGE bit 2): common prefix with the previous prompt, before any
+                        // checkpoint restore moves n_past back
+                        int n_lcp = 0;
+
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
@@ -3223,6 +3313,8 @@ private:
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
                                     n_past = std::min(n_past, slot.alora_invocation_start - 1);
                                 }
+
+                                n_lcp = n_past;
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
@@ -3406,6 +3498,64 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
+                        // Tandem (LLAMA_CKPT_BEFORE_IMAGE): positions of the extra checkpoints for this prompt
+                        //  - ckpt_img_start: the first media token, if it is not cached (n_past <= it). the checkpoint is
+                        //    created in the mtmd loop below, right before the chunk is encoded and decoded, so it holds the
+                        //    state after all text before the image. a later prompt with the same text before a different
+                        //    image (same screen re-queried) restores it and reprocesses only the image and what follows.
+                        //  - ckpt_lcp_break: the common prefix with the previous prompt, when the restore fell at least 64
+                        //    tokens short of it and it lies in the text before the first media chunk. the text batch breaks
+                        //    there and a checkpoint is created at the start of the next batch. an agent's consecutive
+                        //    screenshot steps share the rules, task, app and part of the history (~310-370 tokens), then
+                        //    differ in the history and the control list, so this is where the next step can resume;
+                        //    upstream creates no checkpoint in the text before an image in the single-message format
+                        //    (the n-4 and n-(4+n_ubatch) breaks fall after/inside the image), so each such step
+                        //    re-prefills its whole text prefix. costs at most one extra NPU pass on the step that creates it.
+                        //  both need at least 64 tokens between the restored position and the new checkpoint, so that a
+                        //  ~50 MiB state copy (and possibly a pass) is not spent to save a handful of tokens
+                        slot.ckpt_img_start = -1;
+                        slot.ckpt_lcp_break = -1;
+                        if (ckpt_before_image && mctx) {
+                            int i_media = -1;
+                            for (int i = 0; i < slot.task->n_tokens(); ++i) {
+                                if (input_tokens[i] == LLAMA_TOKEN_NULL) {
+                                    i_media = i;
+                                    break;
+                                }
+                            }
+                            if (i_media >= n_past) { // the first media chunk is not cached
+                                if ((ckpt_before_image & 1) && i_media >= n_past + 64) {
+                                    slot.ckpt_img_start = i_media;
+                                }
+                                if ((ckpt_before_image & 2) && n_lcp < i_media && n_lcp >= n_past + 64) {
+                                    slot.ckpt_lcp_break = n_lcp;
+                                }
+                                SLT_TRC(slot, "LLAMA_CKPT_BEFORE_IMAGE: first media at %d, common prefix %d, n_past %d, "
+                                        "checkpoint before media %d, lcp break %d\n",
+                                        i_media, n_lcp, n_past, slot.ckpt_img_start, slot.ckpt_lcp_break);
+                            }
+                        }
+
+                        // Tandem (LLAMA_CKPT_DIVERGE): the same break at the divergence point n_lcp, also for text-only prompts,
+                        // when it is at least ckpt_diverge (default 32) tokens past the restored position. consecutive agent
+                        // steps first differ in the task, app or history lines and the next step usually shares at least this
+                        // prefix, so it restores here. in steady state the divergence point moves by only a few tokens, so no
+                        // break and no copy is added
+                        if (ckpt_diverge && slot.ckpt_lcp_break < 0) {
+                            int n_text = slot.task->n_tokens(); // tokens before the first media chunk
+                            for (int i = 0; mctx && i < slot.task->n_tokens(); ++i) {
+                                if (input_tokens[i] == LLAMA_TOKEN_NULL) {
+                                    n_text = i;
+                                    break;
+                                }
+                            }
+                            if (n_lcp < n_text && n_lcp >= n_past + ckpt_diverge) {
+                                slot.ckpt_lcp_break = n_lcp;
+                            }
+                            SLT_TRC(slot, "LLAMA_CKPT_DIVERGE: common prefix %d, n_past %d, text before media %d, lcp break %d\n",
+                                    n_lcp, n_past, n_text, slot.ckpt_lcp_break);
+                        }
+
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
 
@@ -3484,6 +3634,26 @@ private:
                             break;
                         }
 
+                        // Tandem (LLAMA_CKPT_BEFORE_IMAGE bit 1): checkpoint the state after the text before the first
+                        // media chunk. the text batch that ends here was decoded in the previous update_slots() round,
+                        // so the memory now holds exactly [0, cur_token_idx). skipped when a checkpoint at this position
+                        // already exists (it was just restored, so the state is the same).
+                        if (do_checkpoint && cur_token_idx == slot.ckpt_img_start) {
+                            const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                            const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+
+                            bool exists = false;
+                            for (const auto & cur : slot.prompt.checkpoints) {
+                                exists = exists || cur.n_tokens == (int64_t) cur_token_idx;
+                            }
+
+                            if (pos_min >= 0 && !exists) {
+                                create_checkpoint(slot, 0, pos_min, pos_max);
+                            } else {
+                                SLT_TRC(slot, "no checkpoint before media at %d (pos_min = %d, exists = %d)\n", cur_token_idx, pos_min, (int) exists);
+                            }
+                        }
+
                         // process the mtmd chunk
                         // note: it submits its own decode, potentially be async
                         //       so the timing is queued and flushed on the next sync
@@ -3556,16 +3726,43 @@ private:
                             }
                         }
 
+                        // Tandem (LLAMA_CKPT_BEFORE_IMAGE bit 2, LLAMA_CKPT_DIVERGE): break at the common prefix with the
+                        // previous prompt, so that a checkpoint is created there (see where ckpt_lcp_break is set)
+                        if (do_checkpoint && slot.prompt.n_tokens() == slot.ckpt_lcp_break) {
+                            break;
+                        }
+
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
+                        //
+                        // Tandem (LLAMA_CKPT_TAIL=0): use the single offset n_ubatch instead.
+                        // the n-4 checkpoint exists for chat continuation: 4 tokens is the tail of the generation prompt
+                        // (for Qwen3.5 with thinking off: "<think>" "\n\n" "</think>" "\n\n"), so a next turn that
+                        // re-renders this assistant turn without the think block matches exactly up to n-4. it costs a
+                        // separate decode pass for the last 4 tokens (83-139 ms on Hexagon) on every request.
+                        // a stateless agent client sends a fresh prompt each step, whose common prefix with this one ends
+                        // at the history block, hundreds of tokens before n-4, so that checkpoint is never restored.
+                        // with the tail pass gone, the old n-(4+n_ubatch) break would make the last batch 516 tokens,
+                        // i.e. still 512+4 ubatches, so it becomes n-n_ubatch: the last batch is exactly one ubatch and
+                        // the total pass count equals ceil(P/n_ubatch) (plus user-start breaks), while a mid-prompt
+                        // checkpoint 4 tokens earlier than before is kept for prompts longer than n_ubatch.
+                        // reuse that is lost with 0 (do not use it for multi-turn chat clients):
+                        //  - a continuation turn, or a re-send of the identical prompt, can restore at most at the last
+                        //    user-message start or at n-n_ubatch, and reprocesses up to n_ubatch more tokens
+                        //  - a cold prompt that fits in one batch and has no user-start break gets no checkpoint at all
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            const int checkpoint_offsets_tail[]   = {4 + n_ubatch, 4};
+                            const int checkpoint_offsets_notail[] = {n_ubatch};
+
+                            const int * offsets_begin = ckpt_tail ? std::begin(checkpoint_offsets_tail)   : std::begin(checkpoint_offsets_notail);
+                            const int * offsets_end   = ckpt_tail ? std::end  (checkpoint_offsets_tail)   : std::end  (checkpoint_offsets_notail);
 
                             bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
+                            for (const int * po = offsets_begin; po != offsets_end; ++po) {
+                                const int offset = *po;
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
@@ -3588,6 +3785,9 @@ private:
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
+                    // Tandem (LLAMA_CKPT_BEFORE_IMAGE bit 2, LLAMA_CKPT_DIVERGE): this batch starts at the common prefix with the previous prompt
+                    const bool is_lcp_break = slot.ckpt_lcp_break > 0 && n_tokens_start == slot.ckpt_lcp_break;
+
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
@@ -3604,7 +3804,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !near_prompt_end && !is_lcp_break) {
                             do_checkpoint = false;
                         }
                     }
@@ -3624,7 +3824,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || near_prompt_end || is_lcp_break ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
