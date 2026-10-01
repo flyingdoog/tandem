@@ -1,3 +1,7 @@
+> **This is Tandem**, a fork of llama.cpp (release b11200) that serves hybrid linear-attention GUI-agent models on
+> Snapdragon NPUs. See **[TANDEM.md](TANDEM.md)** for what it changes and how to build and run it. The rest of this
+> README is upstream llama.cpp's.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
