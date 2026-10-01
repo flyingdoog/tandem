@@ -11,7 +11,8 @@ different binary.
 On a Snapdragon 8 Elite phone serving the fine-tuned Qwen3.5-4B policy of a deployed GUI agent, compared with
 llama.cpp's NPU backend in its fastest configuration, Tandem
 
-- serves text steps **1.32× faster** (24% less time per step) and screenshot steps **1.19× faster** (16% less time),
+- serves text steps with **24% lower latency** (1.49 s against 1.97 s per step) and screenshot steps with **16% lower
+  latency** (4.87 s against 5.80 s),
 - uses **26% less energy** per step,
 - cuts the standby power of a phone with the model loaded **3.4×**, to the level of a phone without a model server,
 - and is **3.3–14× faster** than llama.cpp and MNN on the phone's GPU and CPU.
@@ -40,17 +41,18 @@ screenshot step is from a separate run with speculation.
   backend.
 - **Standby power.** With the model loaded and the screen off, the phone draws 0.22 W under Tandem instead of 0.76 W.
   The next request pays a few milliseconds to restore the power votes.
-- **Hybrid on par with full attention.** llama.cpp serves the hybrid Qwen3.5-4B 1.38× slower than a full-attention
-  model of the same size (Qwen3-VL-4B); under Tandem the two are equally fast.
+- **Hybrid on par with full attention.** llama.cpp needs 38% more time per step for the hybrid Qwen3.5-4B than for a
+  full-attention model of the same size (Qwen3-VL-4B); under Tandem the two are equally fast.
 - **Same answers.** The kernels, the draft head and idle power release leave every output bit unchanged; the
   checkpoint policy and speculation change only the floating-point rounding, which reworded at most one free-text
   summary per trace and changed no action.
 
-![Text-step speedup over llama.cpp on the NPU: Qwen3.5-2B 1.27x, Qwen3.5-4B 1.34x, Qwen3.5-9B 1.42x, the agent policy on the Snapdragon 8 Elite 1.32x and on the Snapdragon 8 Elite Gen 5 1.32x, AndroidControl 1.30x](docs/tandem/speedup.svg)
+![Less time per text step than llama.cpp on the NPU: Qwen3.5-2B 21%, Qwen3.5-4B 25%, Qwen3.5-9B 29%, the agent policy on the Snapdragon 8 Elite 24% and on the Snapdragon 8 Elite Gen 5 24%, AndroidControl 23%](docs/tandem/time-saved.svg)
 
-The gains hold for the stock Qwen3.5 models (top), on the next NPU generation (OnePlus 15, Snapdragon 8 Elite Gen 5,
-Hexagon v81: 1.28 s against 1.69 s per text step, 3.95 s against 4.67 s per screenshot step), and on the public
-AndroidControl benchmark (its first 300 test steps, with identical answers).
+The gains hold for the stock Qwen3.5 models (21–29% less time per text step, growing with the model), on the next NPU
+generation (OnePlus 15, Snapdragon 8 Elite Gen 5, Hexagon v81: 1.28 s against 1.69 s per text step, 24% less, and
+3.95 s against 4.67 s per screenshot step, 15% less), and on the public AndroidControl benchmark (its first 300 test
+steps: 23% less, with identical answers).
 
 In these comparisons, Tandem runs with checkpoints at the divergence point but keeps llama.cpp's tail pass. Dropping it
 as well, as `--agent-checkpoints` does, shortens a text step by about another 0.09 s.
