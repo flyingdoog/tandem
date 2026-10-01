@@ -232,6 +232,8 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
+    struct ggml_tensor * draft_head            = nullptr; // optional trimmed draft LM head [n_embd, n_draft]
+    struct ggml_tensor * draft_ids             = nullptr; // token id of each draft_head row [n_draft], int32
 };
 
 struct llama_layer_switch_lora {

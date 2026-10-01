@@ -1323,6 +1323,7 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_logits_ids  = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -3843,6 +3844,17 @@ void llm_graph_context::build_sampling() const {
 
             assert(sampler->iface->backend_apply);
             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+
+            if (res->t_logits_ids) {
+                // trimmed head: sampled / candidate values are column indices, map them to token ids
+                ggml_tensor * ids = ggml_reshape_2d(ctx0, res->t_logits_ids, 1, res->t_logits_ids->ne[0]);
+                if (data.sampled != nullptr) {
+                    data.sampled = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ids, ggml_cont(ctx0, data.sampled)), ggml_nelements(data.sampled));
+                }
+                if (data.candidates != nullptr) {
+                    data.candidates = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ids, ggml_cont(ctx0, data.candidates)), ggml_nelements(data.candidates));
+                }
+            }
 
             if (data.sampled != nullptr) {
                 if (active) {

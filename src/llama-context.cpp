@@ -1934,7 +1934,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
 
-            if (n_outputs) {
+            if (n_outputs && res->t_logits_ids && t_logits->ne[0] != n_vocab) {
+                // trimmed head: K logits per output, scatter to n_vocab (other tokens -inf)
+                const int64_t n_col = t_logits->ne[0];
+                if ((int64_t) trimmed_ids.size() != n_col) {
+                    trimmed_ids.resize(n_col);
+                    ggml_backend_tensor_get(res->t_logits_ids, trimmed_ids.data(), 0, n_col*sizeof(int32_t));
+                }
+                std::vector<float> tmp(n_outputs*n_col);
+                ggml_backend_tensor_get(t_logits, tmp.data(), 0, tmp.size()*sizeof(float));
+                for (int64_t r = 0; r < n_outputs; ++r) {
+                    float * row = logits_out + r*n_vocab;
+                    std::fill(row, row + n_vocab, -INFINITY);
+                    for (int64_t c = 0; c < n_col; ++c) {
+                        row[trimmed_ids[c]] = tmp[r*n_col + c];
+                    }
+                }
+            } else if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));

@@ -113,6 +113,13 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
+
+        // optional trimmed draft vocabulary (rows of tok_embd for draft_ids)
+        if (const ggml_tensor * meta = ml.get_tensor_meta(tn(LLM_TENSOR_NEXTN_DRAFT_HEAD, "weight", il).str().c_str())) {
+            const int64_t n_draft = meta->ne[1];
+            layer.nextn.draft_head = create_tensor(tn(LLM_TENSOR_NEXTN_DRAFT_HEAD, "weight", il), { n_embd, n_draft }, mtp_flags|TENSOR_NOT_REQUIRED);
+            layer.nextn.draft_ids  = create_tensor(tn(LLM_TENSOR_NEXTN_DRAFT_IDS,  "weight", il), { n_draft },         mtp_flags|TENSOR_NOT_REQUIRED);
+        }
     };
 
     for (int i = 0; i < n_layer; ++i) {
@@ -636,7 +643,13 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    if (layer.nextn.draft_head && layer.nextn.draft_ids) {
+        // trimmed draft vocabulary: logits for draft_ids only, mapped back to token ids by the caller
+        cur = ggml_mul_mat(ctx0, layer.nextn.draft_head, cur);
+        res->t_logits_ids = layer.nextn.draft_ids;
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

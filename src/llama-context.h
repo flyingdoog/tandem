@@ -328,6 +328,8 @@ private:
         std::vector<llama_token> token_ids_full_vocab;
     };
 
+    std::vector<int32_t> trimmed_ids; // host copy of llm_graph_result::t_logits_ids
+
     sampling_info sampling;
 
     // sequence embeddings output (map of [n_embd] vectors)
