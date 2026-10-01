@@ -11,6 +11,40 @@ prompt it shares with the previous step. Speculative decoding has to roll the re
 makes it slower rather than faster. And an idle model keeps the NPU powered up between tasks. Tandem treats the agent
 step as its unit of work and removes these costs; the paper describes the design and its evaluation.
 
+## Results
+
+Server time per agent step on a OnePlus 13T (Snapdragon 8 Elite, Hexagon v79 NPU) for the policy of a deployed GUI
+agent, a fine-tuned Qwen3.5-4B with 4-bit weights (Q4_K_M), replaying the agent's real traffic: 61 text steps and 21
+steps with a screenshot. Every engine runs in its fastest configuration unless marked. In parentheses: the time
+relative to Tandem.
+
+| Engine | Text step | Screenshot step |
+|---|---|---|
+| **Tandem (NPU)** | **1.49 s** | **4.87 s** |
+| llama.cpp (NPU) | 1.97 s (1.32×) | 5.80 s (1.19×) |
+| llama.cpp (NPU, with MTP speculation) | 2.56 s (1.71×) | 7.60 s (1.56×) |
+| MNN (GPU, OpenCL) | 4.98 s (3.3×) | 19.1 s (3.9×)¹ |
+| llama.cpp (GPU, OpenCL) | 5.08 s (3.4×) | 22.8 s (4.7×) |
+| llama.cpp (CPU, 8 threads) | 11.2 s (7.5×) | 69.8 s (14×)² |
+
+¹ 4 of the 21 screenshot steps. ² With MTP speculation, from a separate run.
+
+- **Energy:** on battery, a text step costs 11.1 J above idle power under Tandem against 15.0 J under llama.cpp's
+  NPU backend, 26% less.
+- **Standby power:** with the model loaded and the screen off, the phone draws 0.22 W under Tandem instead of 0.76 W,
+  3.4× less and as little as without a model server. The next request pays a few milliseconds to restore the votes.
+- **Hybrid versus full attention:** llama.cpp serves the hybrid Qwen3.5-4B 1.38× slower than a full-attention model
+  of the same size (Qwen3-VL-4B); under Tandem the two are equally fast.
+- **Model sizes:** on the stock Qwen3.5 models, Tandem's text steps are 1.27× (2B), 1.34× (4B) and 1.42× (9B) faster
+  than llama.cpp's NPU backend.
+- **Next NPU generation:** on a OnePlus 15 (Snapdragon 8 Elite Gen 5, Hexagon v81), 1.28 s against 1.69 s per text
+  step (1.32×) and 3.95 s against 4.67 s per screenshot step (1.18×).
+- **Public benchmark:** on the first 300 test steps of AndroidControl, 1.21 s against 1.58 s per step (1.30×), with
+  identical answers.
+
+In these comparisons Tandem runs with divergence-point checkpoints but keeps the tail pass; dropping it as well, as
+`--agent-checkpoints` does, shortens a text step by about another 0.09 s.
+
 ## What Tandem changes
 
 | Mechanism | Where | What it does | Switch (default) |

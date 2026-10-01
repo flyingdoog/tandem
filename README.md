@@ -1,6 +1,8 @@
 > **This is Tandem**, a fork of llama.cpp (release b11200) that serves hybrid linear-attention GUI-agent models on
-> Snapdragon NPUs. See **[TANDEM.md](TANDEM.md)** for what it changes and how to build and run it. The rest of this
-> README is upstream llama.cpp's.
+> Snapdragon NPUs. On a Snapdragon 8 Elite phone it serves the agent steps of a Qwen3.5-4B policy 1.2-1.3× faster
+> and with 26% less energy than llama.cpp's NPU backend, 3.3-14× faster than GPU and CPU engines, and cuts the
+> standby power of a phone with the model loaded 3.4×. See **[TANDEM.md](TANDEM.md)** for the results, what Tandem
+> changes, and how to build and run it. The rest of this README is upstream llama.cpp's.
 
 # llama.cpp
 
