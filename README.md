@@ -11,8 +11,8 @@ different binary.
 On a Snapdragon 8 Elite phone serving the fine-tuned Qwen3.5-4B policy of a deployed GUI agent, compared with
 llama.cpp's NPU backend in its fastest configuration, Tandem
 
-- serves text steps with **32% lower latency** (1.39 s against 2.03 s per step) and screenshot steps with **18% lower
-  latency** (4.79 s against 5.86 s),
+- serves text steps with **30% lower latency** (1.38 s against 1.96 s per step) and screenshot steps with **16% lower
+  latency** (4.76 s against 5.66 s),
 - uses **33% less energy** per step,
 - cuts the standby power of a phone with the model loaded **3.4×**, to the level of a phone without a model server,
 - and is **3.6–14× faster** than llama.cpp and MNN on the phone's GPU and CPU.
@@ -25,12 +25,12 @@ of work and removes them:
 | | What goes wrong | llama.cpp on the NPU | Tandem |
 |---|---|---|---|
 | **Checkpoint gap** | The recurrent state resumes only at stored checkpoints, and a chat server stores them where a chat would continue | 539 new prompt tokens per step, where a KV cache would need 428 | **460**, with checkpoints where consecutive prompts diverge, in one prefill pass fewer |
-| **Rollback tax** | Speculative decoding has to roll the recurrent state back, which pushes the prefill off the NPU's fast kernel | speculation makes a step **0.59 s slower** | speculation makes a step **0.30 s faster** |
+| **Rollback tax** | Speculative decoding has to roll the recurrent state back, which pushes the prefill off the NPU's fast kernel | speculation makes a step **0.60 s slower** | speculation makes a step **0.18 s faster** |
 | **Residency tax** | The NPU session holds its power votes for as long as the model is loaded | 0.76 W standby with the model loaded | **0.22 W**, as little as without a model server |
 
 ## Results
 
-![Server time per agent step: Tandem 1.39 s per text step and 4.79 s per screenshot step; llama.cpp on the NPU 2.03 and 5.86 s; with speculation 2.62 and 7.80 s; MNN on the GPU 4.98 and 19.1 s; llama.cpp on the GPU 5.11 and 23.5 s; llama.cpp on the CPU 10.8 and 65.3 s](docs/tandem/step-time.svg)
+![Server time per agent step: Tandem 1.38 s per text step and 4.76 s per screenshot step; llama.cpp on the NPU 1.96 and 5.66 s; with speculation 2.55 and 7.47 s; MNN on the GPU 4.98 and 19.1 s; llama.cpp on the GPU 5.07 and 23.1 s; llama.cpp on the CPU 10.7 and 67.2 s](docs/tandem/step-time.svg)
 
 Server time per agent step on a OnePlus 13T (Snapdragon 8 Elite, Hexagon v79) for a fine-tuned Qwen3.5-4B with 4-bit
 weights (Q4_K_M), replaying the agent's real traffic: 61 text steps and 21 steps with a screenshot. Every engine runs in
@@ -40,15 +40,15 @@ its fastest configuration unless marked. MNN's screenshot step is the mean of 4 
   backend.
 - **Standby power.** With the model loaded and the screen off, the phone draws 0.22 W under Tandem instead of 0.76 W.
   Restoring the power votes makes the first request after a 30-second pause about 20 ms longer, about 1% of a step.
-- **Hybrid on par with full attention.** llama.cpp needs 42% more time per step for the hybrid Qwen3.5-4B than for a
-  full-attention model of the same size (Qwen3-VL-4B); under Tandem the hybrid takes only 2% longer.
+- **Hybrid on par with full attention.** llama.cpp needs 43% more time per step for the hybrid Qwen3.5-4B than for a
+  full-attention model of the same size (Qwen3-VL-4B); under Tandem the hybrid takes only 1% longer.
 - **Same answers.** Most kernels, the draft head and idle power release leave every output bit unchanged; the
   verification kernel, the checkpoint policy and speculation change only the floating-point rounding, which reworded
   at most one free-text summary per trace and changed no action.
 
-![Server time per text step, llama.cpp on the NPU against Tandem: Qwen3.5-2B 1.04 and 0.75 s, Qwen3.5-4B 1.85 and 1.27 s, Qwen3.5-9B 3.08 and 1.99 s, the agent policy on the Snapdragon 8 Elite 2.03 and 1.39 s and on the Snapdragon 8 Elite Gen 5 1.66 and 1.21 s, AndroidControl 1.65 and 1.16 s](docs/tandem/text-steps.svg)
+![Server time per text step, llama.cpp on the NPU against Tandem: Qwen3.5-2B 0.99 and 0.73 s, Qwen3.5-4B 1.79 and 1.26 s, Qwen3.5-9B 2.99 and 1.99 s, the agent policy on the Snapdragon 8 Elite 1.96 and 1.38 s and on the Snapdragon 8 Elite Gen 5 1.66 and 1.21 s, AndroidControl 1.57 and 1.13 s](docs/tandem/text-steps.svg)
 
-The gains hold for the stock Qwen3.5 models, where they grow with the model (28–35% less time per text step), on the
+The gains hold for the stock Qwen3.5 models, where they grow with the model (27–34% less time per text step), on the
 next NPU generation (OnePlus 15, Snapdragon 8 Elite Gen 5, Hexagon v81; with screenshots 3.82 s against 4.54 s per
 step, 16% less), and on the public AndroidControl benchmark (its first 300 test steps, with identical answers).
 llama.cpp runs in its fastest configuration, on the NPU without speculation; Tandem runs as in the quick start below,

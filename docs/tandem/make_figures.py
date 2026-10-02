@@ -22,20 +22,20 @@ plt.rcParams.update({
 })
 
 # server time per agent step (s): text step, screenshot step, as measured (bars and ratios) and as printed
-ENGINES = [("Tandem (NPU)", (1.3854, "1.39"), (4.793, "4.79")),
-           ("llama.cpp (NPU)", (2.0328, "2.03"), (5.861, "5.86")),
-           ("llama.cpp (NPU, MTP)", (2.6213, "2.62"), (7.804, "7.80")),
+ENGINES = [("Tandem (NPU)", (1.3766, "1.38"), (4.7586, "4.76")),
+           ("llama.cpp (NPU)", (1.9574, "1.96"), (5.6607, "5.66")),
+           ("llama.cpp (NPU, MTP)", (2.5540, "2.55"), (7.4724, "7.47")),
            ("MNN (GPU)", (4.98, "4.98"), (19.14, "19.1")),
-           ("llama.cpp (GPU)", (5.1072, "5.11"), (23.471, "23.5")),
-           ("llama.cpp (CPU)", (10.849, "10.8"), (65.277, "65.3"))]
+           ("llama.cpp (GPU)", (5.0656, "5.07"), (23.088, "23.1")),
+           ("llama.cpp (CPU)", (10.659, "10.7"), (67.171, "67.2"))]
 
 # server time per text step (s): llama.cpp's NPU backend in its fastest configuration, Tandem
 # (as measured for bars and percentages, as printed in the paper)
-TEXT_STEPS = [("Qwen3.5-2B", (1.0389, "1.04"), (0.7504, "0.75")), ("Qwen3.5-4B", (1.8491, "1.85"), (1.2719, "1.27")),
-              ("Qwen3.5-9B", (3.0830, "3.08"), (1.9944, "1.99")),
-              ("Agent policy\n(8 Elite)", (2.0328, "2.03"), (1.3854, "1.39")),
+TEXT_STEPS = [("Qwen3.5-2B", (0.9913, "0.99"), (0.7269, "0.73")), ("Qwen3.5-4B", (1.7890, "1.79"), (1.2596, "1.26")),
+              ("Qwen3.5-9B", (2.9939, "2.99"), (1.9873, "1.99")),
+              ("Agent policy\n(8 Elite)", (1.9574, "1.96"), (1.3766, "1.38")),
               ("Agent policy\n(8 Elite Gen 5)", (1.6552, "1.66"), (1.2124, "1.21")),
-              ("AndroidControl", (1.6511, "1.65"), (1.1613, "1.16"))]
+              ("AndroidControl", (1.5696, "1.57"), (1.1255, "1.13"))]
 GRAY = "#9AA0A6"
 
 
