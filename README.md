@@ -39,9 +39,9 @@ its fastest configuration unless marked. MNN's screenshot step is the mean of 4 
 - **Energy.** On battery, a text step costs 10.1 J above idle power under Tandem against 15.1 J under llama.cpp's NPU
   backend.
 - **Standby power.** With the model loaded and the screen off, the phone draws 0.22 W under Tandem instead of 0.76 W.
-  Restoring the power votes makes the first request after a 30-second pause about 20 ms longer, about 1% of a step.
+  Restoring the power votes makes the first request after a 30-second pause about 20 ms longer, about 1.5% of a step.
 - **Hybrid on par with full attention.** llama.cpp needs 43% more time per step for the hybrid Qwen3.5-4B than for a
-  full-attention model of the same size (Qwen3-VL-4B); under Tandem the hybrid takes only 1% longer.
+  full-attention model of the same size (Qwen3-VL-4B); under Tandem the hybrid takes only 1.4% longer.
 - **Same answers.** Most kernels, the draft head and idle power release leave every output bit unchanged; the
   verification kernel, the checkpoint policy and speculation change only the floating-point rounding, which reworded
   at most one free-text summary per trace and changed no action.
@@ -66,7 +66,7 @@ with `--agent-checkpoints`.
 | Trimmed draft head | model file | the MTP head drafts over 32,768 rows of the output matrix instead of the full vocabulary | `tools/tandem/make_draft_head.py` |
 | Channel-major convolution, DMA state gathers, fused SwiGLU | NPU | less data movement per prefill pass | on |
 | DDR performance vote | NPU | raises the memory controller's performance mode while requests run | `GGML_HEXAGON_PWR=1` |
-| Idle power release | NPU | relaxes the session's power votes after an idle period and restores them before the next batch | `GGML_HEXAGON_IDLE_MS=3000` |
+| Idle power release | NPU | relaxes the session's power votes after an idle period and restores them before the next batch; if the restore fails three times, no batch is sent and the server aborts so that it can be restarted | `GGML_HEXAGON_IDLE_MS=3000` |
 | Work-queue race fix, watchdog | NPU | the server runs for thousands of requests; an NPU that stops answering becomes a restartable crash | on, `GGML_HEXAGON_WATCHDOG=60` |
 
 The NPU paths can be switched off for comparison with `GGML_HEXAGON_TANDEM_OFF`, a bitmask: 1 verification kernel,

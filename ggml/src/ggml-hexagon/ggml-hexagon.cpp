@@ -104,6 +104,9 @@ static int    opt_pwr_bw  = 0;     // explicit bus bandwidth vote in MB/s for op
 static int    opt_watchdog = 60;   // abort when an op batch gets no NPU response for this many seconds (0 = wait forever)
 static int    opt_idle_ms  = 3000; // relax the NPU power votes after this many ms without op batches (0 = off), see pwr_loop
 static int    opt_idle_log = 0;    // 1 = log each relax / restore as WARN (default INFO, shown with -lv 4)
+static int    opt_pwr_fault = 0;   // test only: make power RPCs fail (GGML_HEXAGON_PWR_FAULT, see pwr_rpc), 0 = off
+static std::atomic<int> opt_pwr_fault_left{-1};  // injected failures left, -1 = no limit
+static std::atomic<int> opt_pwr_fault_skip{0};   // matching RPCs to send normally before the first failure
 static int    opt_chanfast = 16;   // channel-fastest Gated DeltaNet conv input from this many tokens on (0 = off)
 static int    opt_tandem_off = 0;  // turn off Tandem's kernel paths (GGML_HEXAGON_TANDEM_OFF bitmask): 1 small-batch (verification) matmul + host crossover/prefetch, 2 rollback-aware GDN prefill, 4 conv-state CONCAT gather, 8 conv-state CPY gather, 16 MUL_MAT_NX+SWIGLU fusion (host only)
 static bool   opt_dma64   = false;
@@ -565,6 +568,7 @@ struct ggml_hexagon_session {
     std::atomic<int64_t> pwr_last_us{0};       // CLOCK_BOOTTIME of the last batch submit or response
     bool                 pwr_on      = false;  // idle thread started (set and read by the thread that owns the session)
     bool                 pwr_relaxed = false;  // pwr_mtx
+    bool                 pwr_fault   = false;  // pwr_mtx: power state unknown after a failed restore, the session runs no more work
     bool                 pwr_stop    = false;  // pwr_mtx
     bool                 pwr_alarm   = false;  // the idle timer can wake the system from suspend
     int                  pwr_tfd     = -1;     // idle timer
@@ -576,9 +580,10 @@ struct ggml_hexagon_session {
     void pwr_start();
     void pwr_end();
     void pwr_close();
-    void pwr_wake();
+    bool pwr_wake();
     void pwr_loop();
     bool pwr_set(bool relax);
+    int  pwr_rpc(int kind, uint32_t mode, int32_t * r_hmx, int32_t * r_clk, int32_t * r_bw, int32_t * r_dcvs, int32_t * r_us);
 
     ggml_hexagon_shared_buffer * mmap_tensor(const ggml_tensor * t);
     bool clone_buffer(const ggml_hexagon_shared_buffer*);
@@ -3778,34 +3783,51 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
         op_queue->push(req, dbuf, op_batch, seq);
     }
 
+    struct sub_write {
+        ggml_hexagon_session * sess;
+        htp_opbatch_req        req;
+        dspqueue_buffer        dbuf;
+    };
+    std::vector<sub_write> subs;
+    subs.reserve(this->mdev.sessions.size());
+
     for (auto & sub : this->mdev.sessions) {
-        htp_opbatch_req sub_req {};
-        dspqueue_buffer sub_dbuf{};
+        sub_write w { sub.get(), {}, {} };
 
         sub->batch_req_seq = seq;
         op_batch->update_mdev_group(sub->mdev.idx);
 
-        if (!sub->op_queue->push(sub_req, sub_dbuf, op_batch, seq)) {
+        if (!sub->op_queue->push(w.req, w.dbuf, op_batch, seq)) {
             sub->flush_pending(false);
-            sub->op_queue->push(sub_req, sub_dbuf, op_batch, seq);
+            sub->op_queue->push(w.req, w.dbuf, op_batch, seq);
         }
 
-        HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", sub->c_name(), sub_dbuf.ptr, sub_dbuf.size);
+        HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", sub->c_name(), w.dbuf.ptr, w.dbuf.size);
+        subs.push_back(w);
+    }
 
-        sub->pwr_wake();
+    // Restore the power votes of all sessions before the first write (after the batch_req_seq updates: pwr_loop sees
+    // the batch as in flight from here on). If one fails, write nothing: a batch on a relaxed NPU may never finish.
+    bool powered = true;
+    for (auto & w : subs) {
+        powered = w.sess->pwr_wake() && powered;
+    }
+    powered = this->pwr_wake() && powered;
+    if (!powered) {
+        GGML_ABORT("ggml-hex: %s NPU power failure: op batch %llu not submitted, restart the process\n", this->c_name(), (unsigned long long) seq);
+    }
 
+    for (auto & w : subs) {
         int err;
         do {
-            err = dspqueue_write(sub->queue, 0, 1, &sub_dbuf, sizeof(sub_req), (const uint8_t*) &sub_req, DSPQUEUE_TIMEOUT);
+            err = dspqueue_write(w.sess->queue, 0, 1, &w.dbuf, sizeof(w.req), (const uint8_t*) &w.req, DSPQUEUE_TIMEOUT);
         } while (err == AEE_EINTERRUPTED);
         if (err != 0) {
-            GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", sub->c_name(), (unsigned) err);
+            GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", w.sess->c_name(), (unsigned) err);
         }
     }
 
     HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", this->c_name(), dbuf.ptr, dbuf.size);
-
-    this->pwr_wake();  // after batch_req_seq was incremented: pwr_loop sees this batch as in flight from here on
 
     int err;
     do {
@@ -4283,24 +4305,57 @@ void ggml_hexagon_session::pwr_end() {
 #endif
 }
 
-// relax or restore the DSP power votes; the caller holds pwr_mtx. Returns false when the relax RPC failed.
+enum { PWR_RPC_RELAX = 1, PWR_RPC_RESTORE = 2, PWR_RPC_COMP = 3 };
+
+// The power RPC of a relax, a restore or the restore after a failed relax (comp). Test only, GGML_HEXAGON_PWR_FAULT=<f>[,<n>[,<skip>]]
+// makes n RPCs (all if n is 0 or missing) fail after the first skip: f 1 relax, 2 restore, 4 relax and comp: not sent, transport error; 3 restore: sent, HMX vote error.
+int ggml_hexagon_session::pwr_rpc(int kind, uint32_t mode, int32_t * r_hmx, int32_t * r_clk, int32_t * r_bw, int32_t * r_dcvs, int32_t * r_us) {
+    const bool hit = (opt_pwr_fault == 1 && kind == PWR_RPC_RELAX) || ((opt_pwr_fault == 2 || opt_pwr_fault == 3) && kind == PWR_RPC_RESTORE) ||
+                     (opt_pwr_fault == 4 && kind != PWR_RPC_RESTORE);
+    int skip = hit ? opt_pwr_fault_skip.load() : 0;
+    while (skip > 0 && !opt_pwr_fault_skip.compare_exchange_weak(skip, skip - 1)) {}
+    int left = hit && skip == 0 ? opt_pwr_fault_left.load() : 0;
+    while (left > 0 && !opt_pwr_fault_left.compare_exchange_weak(left, left - 1)) {}
+    if (!hit || skip > 0 || left == 0) {
+        return htp_iface_power(this->handle, mode, 0, r_hmx, r_clk, r_bw, r_dcvs, r_us);
+    }
+    const char * what = kind == PWR_RPC_RELAX ? "relax" : kind == PWR_RPC_RESTORE ? "restore" : "comp";
+    if (opt_pwr_fault == 3) {
+        const int err = htp_iface_power(this->handle, mode, 0, r_hmx, r_clk, r_bw, r_dcvs, r_us);
+        *r_hmx = -1;
+        GGML_LOG_WARN("ggml-hex: %s GGML_HEXAGON_PWR_FAULT: %s sent, HMX vote error reported\n", this->c_name(), what);
+        return err;
+    }
+    GGML_LOG_WARN("ggml-hex: %s GGML_HEXAGON_PWR_FAULT: %s not sent, transport error reported\n", this->c_name(), what);
+    return (int) 0x8000040e;  // a FastRPC transport error
+}
+
+// Relax or restore the DSP power votes; the caller holds pwr_mtx. Returns false when the RPC or a vote failed. A failed
+// restore keeps pwr_relaxed set. A failed relax puts the votes back; if that fails too, the power state is unknown (pwr_fault).
 bool ggml_hexagon_session::pwr_set(bool relax) {
     int32_t r_hmx = 0, r_clk = 0, r_bw = 0, r_dcvs = 0, r_us = 0;
     const uint32_t mode = HTP_PWR_IDLE | (relax ? 1u : 0u);
     const int64_t  t0   = ggml_hexagon_boottime_us();
-    const int      err  = htp_iface_power(this->handle, mode, 0, &r_hmx, &r_clk, &r_bw, &r_dcvs, &r_us);
+    const int      err  = pwr_rpc(relax ? PWR_RPC_RELAX : PWR_RPC_RESTORE, mode, &r_hmx, &r_clk, &r_bw, &r_dcvs, &r_us);
     const int64_t  t1   = ggml_hexagon_boottime_us();
 
     if (err != 0 || r_dcvs != 0 || r_hmx != 0 || r_bw != 0) {
         pwr_n_err++;
         GGML_LOG_WARN("ggml-hex: %s idle power %s: error 0x%x (dcvs %d hmx %d bw %d)\n", this->c_name(), relax ? "relax" : "restore",
                       (unsigned) err, r_dcvs, r_hmx, r_bw);
-    }
-    if (relax && err != 0) {
-        // DSP state unknown: put the session votes back and stop relaxing
-        htp_iface_power(this->handle, HTP_PWR_IDLE, 0, &r_hmx, &r_clk, &r_bw, &r_dcvs, &r_us);
-        pwr_relaxed = false;
-        GGML_LOG_WARN("ggml-hex: %s idle power release stopped: the NPU power votes stay on\n", this->c_name());
+        if (relax) {
+            // DSP state unknown: put the session votes back and stop relaxing
+            r_hmx = r_clk = r_bw = r_dcvs = r_us = 0;
+            const int e2 = pwr_rpc(PWR_RPC_COMP, HTP_PWR_IDLE, &r_hmx, &r_clk, &r_bw, &r_dcvs, &r_us);
+            pwr_relaxed  = false;
+            if (e2 != 0 || r_dcvs != 0 || r_hmx != 0 || r_bw != 0) {
+                pwr_fault = true;
+                GGML_LOG_ERROR("ggml-hex: %s NPU power failure: restore after the failed relax failed too (error 0x%x, dcvs %d hmx %d bw %d), no more op batches\n",
+                               this->c_name(), (unsigned) e2, r_dcvs, r_hmx, r_bw);
+            } else {
+                GGML_LOG_WARN("ggml-hex: %s idle power release stopped: the NPU power votes stay on\n", this->c_name());
+            }
+        }
         return false;
     }
 
@@ -4325,19 +4380,31 @@ bool ggml_hexagon_session::pwr_set(bool relax) {
     return true;
 }
 
-// before an op batch is written to the queue: restore the votes if relaxed (waits for a running relax)
-void ggml_hexagon_session::pwr_wake() {
+// Before an op batch is written to the queue: restore the votes if relaxed (waits for a running relax). Returns false
+// if the session must not run work: the restore failed 3 times, or an earlier failure left the power state unknown.
+bool ggml_hexagon_session::pwr_wake() {
 #ifndef _WIN32
     if (!pwr_on) {
-        return;
+        return true;
     }
     std::lock_guard<std::mutex> lock(pwr_mtx);
+    if (pwr_fault) {
+        return false;
+    }
     pwr_last_us = ggml_hexagon_boottime_us();
     if (pwr_relaxed) {
-        pwr_set(false);
+        for (int i = 0; !pwr_set(false); i++) {
+            if (i == 2) {
+                pwr_fault = true;
+                GGML_LOG_ERROR("ggml-hex: %s NPU power failure: restore of the power votes failed 3 times, no more op batches\n", this->c_name());
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10 << (2 * i)));
+        }
         ggml_hexagon_fd_signal(pwr_efd);  // re-arm the idle timer
     }
 #endif
+    return true;
 }
 
 void ggml_hexagon_session::pwr_loop() {
@@ -4622,6 +4689,12 @@ void ggml_hexagon_session::release() noexcept(true) {
     pwr_end();
 
     this->mdev.sessions.clear();
+
+    if (pwr_fault) {
+        // power state unknown: no stop, unmap or close RPC, the driver releases the session when the process exits
+        GGML_LOG_ERROR("ggml-hex: %s NPU power failure: session released without its DSP calls\n", this->c_name());
+        return;
+    }
 
     int err;
 
@@ -8636,6 +8709,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_dma64    = getenv("GGML_HEXAGON_DMA64");
     const char * str_tandem_off = getenv("GGML_HEXAGON_TANDEM_OFF");
     const char * str_idle_ms  = getenv("GGML_HEXAGON_IDLE_MS");
+    const char * str_pwr_fault = getenv("GGML_HEXAGON_PWR_FAULT");
 
     // Init Arch first since it affects other defaults
     if (!str_arch) {
@@ -8697,6 +8771,15 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
         opt_idle_ms = std::max(0, atoi(str_idle_ms));
         const char * c = strchr(str_idle_ms, ',');
         opt_idle_log = c ? atoi(c + 1) : 0;
+    }
+    if (str_pwr_fault) {  // <f>[,<n>[,<skip>]], see pwr_rpc
+        opt_pwr_fault = atoi(str_pwr_fault);
+        const char * c = strchr(str_pwr_fault, ',');
+        const int    n = c ? atoi(c + 1) : 0;
+        opt_pwr_fault_left = n > 0 ? n : -1;
+        c = c ? strchr(c + 1, ',') : nullptr;
+        opt_pwr_fault_skip = c ? std::max(0, atoi(c + 1)) : 0;
+        GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_PWR_FAULT=%s: test only, power RPCs fail on purpose\n", str_pwr_fault);
     }
 #ifdef _WIN32
     opt_idle_ms = 0;  // pwr_loop uses timerfd / epoll
