@@ -11,5 +11,3 @@ The archive contains the generic patch, earlier CPY patch and diagnostic variant
 Models, binaries, private-model records, proprietary SDK objects or disassembly, credentials, device identifiers and network addresses are excluded.
 
 Archive SHA-256: `d79ef327fb06b5fdfbf8e5e044c7752c4c83eb8c0f8ea6a1fcfd633e9da87423`.
-
-AI assistance was used for analysis, patch preparation, review, build and device testing, and evidence packaging at the contributor's request.
