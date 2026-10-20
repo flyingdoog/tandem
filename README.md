@@ -1,5 +1,6 @@
 # Tandem: serving hybrid linear-attention GUI agents on mobile NPUs
 
+[![arXiv](https://img.shields.io/badge/arXiv-2610.26660-b31b1b)](https://arxiv.org/abs/2610.26660)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Based on llama.cpp b11200](https://img.shields.io/badge/based%20on-llama.cpp%20b11200-informational)](https://github.com/ggml-org/llama.cpp)
 
@@ -7,6 +8,8 @@ Tandem serves hybrid linear-attention models, such as Qwen3.5 with its Gated Del
 agent on the Hexagon NPU of Snapdragon phones. It is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) and a
 **drop-in replacement for `llama-server`**: the HTTP API is unchanged, so an agent switches to Tandem by starting a
 different binary.
+
+Paper: [Tandem: Serving Hybrid Linear-Attention GUI Agents on Mobile NPUs](https://arxiv.org/abs/2610.26660) (arXiv 2610.26660).
 
 On a Snapdragon 8 Elite phone serving the fine-tuned Qwen3.5-4B policy of a deployed GUI agent, compared with
 llama.cpp's NPU backend in its fastest configuration, Tandem
@@ -120,7 +123,7 @@ LD_LIBRARY_PATH=$PWD/lib ./bin/llama-server -m model-Q4_K_M-dh.gguf --mmproj mmp
 
 ## Citation
 
-If you use Tandem in your research, please cite:
+If you use Tandem in your research, please cite [our paper](https://arxiv.org/abs/2610.26660):
 
 ```bibtex
 @misc{chen2026tandemservinghybridlinearattention,
