@@ -118,6 +118,22 @@ LD_LIBRARY_PATH=$PWD/lib ./bin/llama-server -m model-Q4_K_M-dh.gguf --mmproj mmp
 - Requests that ask for log-probabilities make the server compute full-vocabulary probabilities, which costs time on
   every generated token without speculation.
 
+## Citation
+
+If you use Tandem in your research, please cite:
+
+```bibtex
+@misc{chen2026tandemservinghybridlinearattention,
+      title={Tandem: Serving Hybrid Linear-Attention GUI Agents on Mobile NPUs},
+      author={Zhuomin Chen and Jingchao Ni and Xu Zheng and Yong Chen and Mo Sha and Wei Cheng and Dongsheng Luo},
+      year={2026},
+      eprint={2610.26660},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2610.26660},
+}
+```
+
 ## License
 
 MIT, like llama.cpp; Tandem's changes are released under the same license. Tandem is built on llama.cpp and its
